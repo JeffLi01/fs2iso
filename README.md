@@ -103,8 +103,8 @@ EFI Shell / Windows 中显示哪个命名空间取决于读取驱动的能力：
 next             卷描述符集终止符
 next             El Torito 启动目录（1 扇区，可选）
 next             L/M 路径表（base、joliet 各一对）
-next             base 命名空间目录块（DFS 序）
-next             Joliet 命名空间目录块（DFS 序）
+next             base 命名空间目录块（路径表序，ECMA-119 §6.9.1）
+next             Joliet 命名空间目录块（路径表序）
 next             文件内容（逐扇区对齐）
 ```
 

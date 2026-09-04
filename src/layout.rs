@@ -8,8 +8,8 @@
 //!   next         Volume Descriptor Set Terminator
 //!   next         El Torito boot catalog (1 sector)          [optional]
 //!   next         path tables (base L, base M, joliet L, joliet M; each padded to whole sectors)
-//!   next         directory-record blocks, base namespace, DFS order
-//!   next         directory-record blocks, Joliet namespace, DFS order
+//!   next         directory-record blocks, base namespace, path-table order
+//!   next         directory-record blocks, Joliet namespace, path-table order
 //!   next         file contents (each padded to a whole sector)
 //!
 //! Field offsets follow ECMA-119 and the El Torito 1.0 spec (cross-checked
@@ -91,6 +91,18 @@ fn children_sorted(t: &Tree, d: usize, ns: Ns) -> Vec<usize> {
     let mut kids = t.arena[d].children.clone();
     kids.sort_unstable_by(|&a, &b| ns_id(t, a, ns).cmp(ns_id(t, b, ns)));
     kids
+}
+
+/// Directory blocks are placed in *path-table order* (root first, then level
+/// by level, children grouped under their parent), per ECMA-119 §6.9.1 which
+/// couples directory-record volume order to path-table order. Strict readers
+/// (e.g. Windows CDFS when resolving a subdirectory through the path table)
+/// tolerate this layout best; pointer-based readers are unaffected.
+fn dirs_pt_order(t: &Tree, ns: Ns) -> Vec<usize> {
+    path_table_entries(t, ns)
+        .iter()
+        .map(|(d, _, _)| *d)
+        .collect()
 }
 
 /// DFS pre-order of all dirs in namespace child order.
@@ -235,17 +247,17 @@ pub fn assign_lbas(
         (0, 0)
     };
 
-    // base-namespace directory blocks, DFS order
-    for d in dirs_dfs(t, Ns::Base) {
+    // base-namespace directory blocks, path-table order (ECMA-119 6.9.1)
+    for d in dirs_pt_order(t, Ns::Base) {
         let lens = dir_record_lens(t, d, Ns::Base);
         let secs = pack_sectors(&lens);
         t.arena[d].base_lba = next;
         t.arena[d].sectors = secs;
         next += secs;
     }
-    // joliet-namespace directory blocks, DFS order
+    // joliet-namespace directory blocks, path-table order
     if use_joliet {
-        for d in dirs_dfs(t, Ns::Jol) {
+        for d in dirs_pt_order(t, Ns::Jol) {
             let lens = dir_record_lens(t, d, Ns::Jol);
             let secs = pack_sectors(&lens);
             t.arena[d].jol_lba = next;
@@ -561,7 +573,7 @@ fn build_vd(
                 &mut buf,
                 vd_type,
                 &vid_be,
-                Some(b"%/@%/C%/E"),
+                Some(b"%/E"), // Joliet level 3 escape (matches genisoimage/Nero)
                 root_lba,
                 root_len,
                 t.arena[t.root].mtime,
@@ -710,13 +722,13 @@ pub fn render_image(
         write_pt(out, t, Ns::Jol, plan.pt_jol).map_err(&werr)?;
     }
 
-    for d in dirs_dfs(t, Ns::Base) {
+    for d in dirs_pt_order(t, Ns::Base) {
         let blk = render_dir_block(t, d, Ns::Base);
         debug_assert_eq!(blk.len(), t.arena[d].sectors as usize * SECTOR);
         out.write_all(&blk).map_err(&werr)?;
     }
     if use_joliet {
-        for d in dirs_dfs(t, Ns::Jol) {
+        for d in dirs_pt_order(t, Ns::Jol) {
             let blk = render_dir_block(t, d, Ns::Jol);
             debug_assert_eq!(blk.len(), t.arena[d].jol_sectors as usize * SECTOR);
             out.write_all(&blk).map_err(&werr)?;
