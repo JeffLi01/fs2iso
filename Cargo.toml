@@ -1,0 +1,8 @@
+[package]
+name = "fs2iso"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust packer: pack files/directories into an ISO9660 (+Joliet, optional El Torito EFI boot) image, for BMC virtual media / UEFI shell (fs0) use"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
