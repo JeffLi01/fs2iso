@@ -70,6 +70,8 @@ def main():
 
     missing = set(expected) - set(jol_files)
     extra = set(jol_files) - set(expected)
+    # hadris-iso adds its own root-level "boot.catalog" when El Torito is enabled
+    extra.discard("boot.catalog")
     size_bad = [k for k in expected if jol_files.get(k) != expected[k]]
 
     probes = sorted(expected)[:2]

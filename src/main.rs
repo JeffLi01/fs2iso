@@ -102,15 +102,7 @@ fn main() {
                     if sum.joliet { " + Joliet" } else { "" }
                 );
                 match &sum.boot_path {
-                    Some(p) => {
-                        // first path segment is the synthetic in-memory root;
-                        // the real ISO path starts at the packed payload name
-                        let rel = match p.split_once('/') {
-                            Some((_, rest)) => rest,
-                            None => p.as_str(),
-                        };
-                        println!("  El Torito EFI boot: /{}", rel);
-                    }
+                    Some(p) => println!("  El Torito EFI boot: /{}", p),
                     None => println!("  El Torito: none (data CD)"),
                 }
             }
