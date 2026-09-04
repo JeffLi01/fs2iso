@@ -6,3 +6,4 @@ description = "Pure-Rust packer: pack files/directories into an ISO9660 (+Joliet
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+clap = { version = "4.5", features = ["derive"] }

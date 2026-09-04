@@ -1,8 +1,9 @@
 //! fs2iso — pure-Rust packer: files/directories -> ISO9660 (+Joliet, optional
 //! El Torito EFI boot) image for BMC virtual media / UEFI shell use.
 //!
-//! Zero external dependencies: ISO9660 structures are written from first
-//! principles (ECMA-119) with no third-party crates.
+//! The library itself is dependency-free: ISO9660 structures are written from
+//! first principles (ECMA-119). Only the CLI binary (src/main.rs) uses clap
+//! for command-line argument parsing.
 
 pub mod layout;
 pub mod names;
