@@ -47,10 +47,6 @@ struct Cli {
     #[arg(long)]
     no_eltorito: bool,
 
-    /// Do not add the Joliet (original-name) namespace
-    #[arg(long)]
-    no_joliet: bool,
-
     /// Suppress the summary output
     #[arg(short, long)]
     quiet: bool,
@@ -71,7 +67,6 @@ fn main() {
         flat: cli.flat,
         boot_efi: cli.boot_efi,
         no_eltorito: cli.no_eltorito,
-        no_joliet: cli.no_joliet,
     };
 
     let ext = cli
@@ -97,10 +92,7 @@ fn main() {
                     sum.dirs, sum.files, mb
                 );
                 println!("  label: {}", sum.label);
-                println!(
-                    "  namespaces: ISO9660{}",
-                    if sum.joliet { " + Joliet" } else { "" }
-                );
+                println!("  namespaces: ISO9660");
                 match &sum.boot_path {
                     Some(p) => println!("  El Torito EFI boot: /{}", p),
                     None => println!("  El Torito: none (data CD)"),
