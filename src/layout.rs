@@ -3,8 +3,8 @@
 //! Volume layout (all LBAs are 2048-byte sectors):
 //!   [0..16)      system area (zeros)
 //!   16           Primary Volume Descriptor
-//!   17           Supplementary Volume Descriptor (Joliet)   [optional]
-//!   18           Boot Record VD (El Torito)                 [optional]
+//!   17           Boot Record VD (El Torito)                 [optional]
+//!   18           Supplementary Volume Descriptor (Joliet)   [optional]
 //!   next         Volume Descriptor Set Terminator
 //!   next         El Torito boot catalog (1 sector)          [optional]
 //!   next         path tables (base L, base M, joliet L, joliet M; each padded to whole sectors)
