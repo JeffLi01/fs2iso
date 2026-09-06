@@ -1,24 +1,21 @@
 //! fs2iso — pack files/directories into an optical image for BMC virtual
 //! media / UEFI shell use.
 //!
-//! The payload is DATA first: the default output is a plain **ISO9660 +
-//! Joliet** data disc (base namespace for ISO9660-only readers; Joliet keeps
-//! original names incl. Chinese) — mountable and browsable by any reader
-//! with an ISO9660 driver (Windows, AMI-class firmware shells, ...). UDF is
-//! intentionally disabled (see `build_iso`): hadris-cd's UDF layer is not
-//! spec-complete (missing ECMA-167 file-set terminator) — EDK2's UdfDxe
-//! reads it, but Windows' udfs.sys rejects the whole volume.
+//! Every payload file/directory is packed into a **FAT image (`esp.img`)** —
+//! original names, original structure, no special-casing (it does not matter
+//! whether some file is an EFI boot program). The El Torito entry points at
+//! `esp.img`, so firmware loads/exposes the FAT volume and the EFI shell
+//! sees the payload as `fs0`/`fsX`. The same payload is ALSO kept in the
+//! ISO9660(+Joliet) data tree of the disc (base = uppercase names for
+//! ISO9660-only readers; Joliet = original names incl. Chinese) for readers
+//! that mount the disc data directly (Windows, ISO9660-capable firmware
+//! shells). UDF is not used (hadris-cd's UDF layer is not spec-complete).
 //!
-//! Booting is optional and never forced: when the payload contains
-//! `EFI/BOOT/BOOTX64.EFI` (or `--boot-efi` is given) every payload file is
-//! additionally mirrored into a generated FAT image (`esp.img`, see `esp`)
-//! that the El Torito entry loads — EDK2-style firmware boots such discs and
-//! shows the payload on `fs0:`. A payload without a boot file builds a plain
-//! data disc, never an error; `--no-eltorito` suppresses boot.
+//! `--no-eltorito` produces a plain ISO9660+Joliet data disc without the
+//! FAT container.
 //!
 //! This crate owns the CLI-facing semantics: keep-parent / --flat payload
-//! collection, duplicate and overwrite guards, optional El Torito boot-file
-//! resolution and the build summary.
+//! collection, duplicate and overwrite guards and the build summary.
 
 mod esp;
 
@@ -34,7 +31,8 @@ pub struct Options {
     pub label: Option<String>,
     /// mkisofs-style: directory arguments merge their *contents* into the root.
     pub flat: bool,
-    /// Disable El Torito boot entirely.
+    /// Do not pack the FAT container / add an El Torito entry — produce a
+    /// plain ISO9660+Joliet data disc.
     pub no_eltorito: bool,
 }
 
@@ -55,8 +53,9 @@ pub struct BuildSummary {
     pub files: u64,
     pub payload_bytes: u64,
     pub sectors: u64,
-    /// ISO-relative path of the El Torito boot file, if any.
-    pub boot_path: Option<String>,
+    /// True when the disc carries a FAT container (esp.img) with an El
+    /// Torito boot entry.
+    pub bootable: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -298,20 +297,6 @@ pub(crate) fn sanitize_label(raw: &str) -> String {
     out
 }
 
-fn resolve_boot(opts: &Options, recs: &[FileRec]) -> Result<Option<String>, String> {
-    // Boot discovery is purely a naming convention: a payload file at any
-    // depth whose path ends in efi/boot/bootx64.efi makes the disc bootable.
-    // (Keep-parent packs a directory as-is, so e.g. `pkg/EFI/BOOT/BOOTX64.EFI`
-    // counts.) --no-eltorito disables boot even then.
-    if opts.no_eltorito {
-        return Ok(None);
-    }
-    Ok(recs
-        .iter()
-        .find(|r| r.rel.to_lowercase().ends_with("efi/boot/bootx64.efi"))
-        .map(|r| r.rel.clone()))
-}
-
 // ---------------------------------------------------------------------------
 // entry point
 // ---------------------------------------------------------------------------
@@ -346,93 +331,63 @@ pub fn build_iso(
         },
     };
 
-    let boot_rel = resolve_boot(opts, &collected.recs)?;
     let mut image_options = OpticalImageOptions::default();
     image_options.volume_id = label.clone();
-    // UDF layer disabled: hadris-cd's UDF metadata is incomplete (missing
-    // ECMA-167 file-set terminator). EDK2's UdfDxe tolerates it (QEMU
-    // acceptance passed) but Windows' udfs.sys rejects the whole volume —
-    // verified on this host: bridge images mount as a drive but are
-    // unreadable, while ISO9660(+Joliet) images from the same writer mount
-    // fine. Default output is therefore plain ISO9660 + Joliet, which
-    // Windows and mainstream (AMI-class) BMC firmware both read. The UDF
-    // bridge variant lives in git history (commit 9f17b72) until the UDF
-    // writer is spec-complete.
     image_options.udf.enabled = false;
 
-    // === Optional boot: FAT container (esp.img) ===
-    // The payload is first and foremost DATA — a plain ISO9660+Joliet data
-    // disc is produced by default, mountable and browsable by any reader
-    // with an ISO9660 driver (Windows, AMI-class firmware shells, ...).
-    // Boot is only added when the user actually wants to boot the disc:
-    // detecting EFI/BOOT/BOOTX64.EFI in the payload (or an explicit
-    // --boot-efi). In that case every payload file is ALSO mirrored into a
-    // FAT image (esp.img) that the El Torito entry loads — EDK2-style
-    // firmware boots such discs and shows the payload on fs0. Nothing is
-    // forced: no boot file in the payload means a plain data disc, never an
-    // error. --no-eltorito suppresses boot even when a boot file exists.
-    let boot_path_out: Option<String> = match &boot_rel {
-        None => None, // data disc
-        Some(rel) => {
-            if collected.recs.iter().any(|r| fold(&r.rel) == "ESP.IMG") {
-                return Err(
-                    "payload contains 'esp.img' which is reserved for the generated \
-                     EFI boot container; rename it"
-                        .to_string(),
-                );
-            }
-
-            // mirror every payload file into the FAT container
-            let mut esp_entries: Vec<(String, Vec<u8>)> =
-                Vec::with_capacity(collected.recs.len() + 1);
-            for r in &collected.recs {
-                let b = std::fs::read(&r.src)
-                    .map_err(|e| format!("cannot read {:?}: {}", r.src, e))?;
-                esp_entries.push((r.rel.clone(), b));
-            }
-            // guaranteed standard boot path (wins over a mirrored same-name file)
-            const STD_BOOT: &str = "EFI/BOOT/BOOTX64.EFI";
-            let boot_bytes = esp_entries
-                .iter()
-                .find(|(pp, _)| fold(pp) == fold(STD_BOOT))
-                .or_else(|| esp_entries.iter().find(|(pp, _)| pp == rel))
-                .map(|(_, b)| b.clone())
-                .ok_or_else(|| format!("boot file record missing: {}", rel))?;
-            if !esp_entries.iter().any(|(pp, _)| fold(pp) == fold(STD_BOOT)) {
-                esp_entries.push((STD_BOOT.to_string(), boot_bytes.clone()));
-            }
-
-            let esp_bytes = esp::build_esp(&esp_entries)?;
-            collected
-                .tree
-                .root
-                .add_file(hadris_cd::FileEntry::from_buffer("esp.img", esp_bytes));
-            collected.tree.root.sort();
-
-            use hadris_iso::boot::options::{
-                BootEntryOptions, BootOptions, BootSectionOptions,
-            };
-            use hadris_iso::boot::{EmulationType, PlatformId};
-            let entry = BootEntryOptions {
-                load_size: None,
-                boot_image_path: "esp.img".to_string(),
-                boot_info_table: false,
-                grub2_boot_info: false,
-                emulation: EmulationType::NoEmulation,
-            };
-            image_options.boot = Some(BootOptions {
-                write_boot_catalog: true,
-                default: entry.clone(),
-                entries: vec![(
-                    BootSectionOptions {
-                        platform: PlatformId::UEFI,
-                    },
-                    entry,
-                )],
-            });
-            Some(rel.clone())
+    // === FAT container (esp.img) holds EVERY payload file ===
+    // The user's files/directories are packed into a FAT image (esp.img)
+    // verbatim — original names, original structure, whether or not any of
+    // them is an EFI boot program. The El Torito entry points at esp.img so
+    // firmware loads/exposes the FAT volume (shell flows then see the files
+    // as fs0/fsX). The same payload also stays in the ISO9660(+Joliet) data
+    // tree for readers that mount the disc data directly (Windows,
+    // ISO9660-capable firmware shells). Nothing is added, renamed or
+    // special-cased. --no-eltorito produces a plain data disc without the
+    // FAT container.
+    let bootable = !opts.no_eltorito;
+    if bootable {
+        if collected.recs.iter().any(|r| fold(&r.rel) == "ESP.IMG") {
+            return Err(
+                "payload contains a root-level file named 'esp.img', which is \
+                 reserved for the generated FAT container; rename it"
+                    .to_string(),
+            );
         }
-    };
+        let mut esp_entries: Vec<(String, Vec<u8>)> =
+            Vec::with_capacity(collected.recs.len());
+        for r in &collected.recs {
+            let b = std::fs::read(&r.src)
+                .map_err(|e| format!("cannot read {:?}: {}", r.src, e))?;
+            esp_entries.push((r.rel.clone(), b));
+        }
+        let esp_bytes = esp::build_esp(&esp_entries)?;
+        collected
+            .tree
+            .root
+            .add_file(hadris_cd::FileEntry::from_buffer("esp.img", esp_bytes));
+        collected.tree.root.sort();
+
+        use hadris_iso::boot::options::{BootEntryOptions, BootOptions, BootSectionOptions};
+        use hadris_iso::boot::{EmulationType, PlatformId};
+        let entry = BootEntryOptions {
+            load_size: None,
+            boot_image_path: "esp.img".to_string(),
+            boot_info_table: false,
+            grub2_boot_info: false,
+            emulation: EmulationType::NoEmulation,
+        };
+        image_options.boot = Some(BootOptions {
+            write_boot_catalog: true,
+            default: entry.clone(),
+            entries: vec![(
+                BootSectionOptions {
+                    platform: PlatformId::UEFI,
+                },
+                entry,
+            )],
+        });
+    }
 
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -454,7 +409,7 @@ pub fn build_iso(
         files: collected.recs.len() as u64,
         payload_bytes: collected.payload_bytes,
         sectors,
-        boot_path: boot_path_out,
+        bootable,
     })
 }
 

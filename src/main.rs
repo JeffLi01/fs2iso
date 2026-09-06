@@ -15,16 +15,17 @@ use std::path::PathBuf;
 ///
 /// With --flat, a directory's *contents* are merged into the root instead.
 ///
-/// The image carries both an ISO9660 base tree (uppercase names, readable by
-/// any UEFI firmware) and a Joliet tree (original names incl. Chinese / long
-/// names). Mount it on the BMC as CD/DVD virtual media, then in the EFI shell
-/// run `map -r` and `fs0:`.
+/// All payload files are packed into a FAT image (esp.img) at their original
+/// paths — no special-casing, no injected boot file — and the El Torito
+/// entry points at esp.img so firmware exposes the FAT volume to the EFI
+/// shell (fs0/fsX). The payload is also kept in the ISO9660(+Joliet) data
+/// tree for readers that mount the disc data directly (Windows).
 #[derive(Parser)]
 #[command(
     name = "fs2iso",
     version,
     about = "Pack files/directories into an ISO 9660 image (BMC virtual media / UEFI shell)",
-    after_help = "EXAMPLES:\n    fs2iso tools.iso D:\\fw\\efi_tools    # data disc\n    fs2iso --flat fix.iso FixPkg/         # data disc: contents at root\n    # bootable disc: put EFI/BOOT/BOOTX64.EFI inside the payload\n")]
+    after_help = "EXAMPLES:\n    fs2iso tools.iso D:\\fw\\efi_tools    # files also inside esp.img (FAT)\n    fs2iso --flat fix.iso FixPkg/         # contents at root, mirrored into esp.img\n    fs2iso --no-eltorito data.iso files/  # plain ISO9660 data disc, no esp.img\n")]
 struct Cli {
     /// Volume label (default: derived from the output file name)
     #[arg(short = 'l', long, value_name = "NAME")]
@@ -83,12 +84,10 @@ fn main() {
                 );
                 println!("  label: {}", sum.label);
                 println!("  namespaces: ISO9660 + Joliet");
-                match &sum.boot_path {
-                    Some(p) => println!(
-                        "  El Torito EFI boot: /{} (payload mirrored into FAT esp.img)",
-                        p
-                    ),
-                    None => println!("  boot: none (data disc)"),
+                if sum.bootable {
+                    println!("  FAT container esp.img: all payload files inside; El Torito -> esp.img");
+                } else {
+                    println!("  no esp.img (data disc, --no-eltorito)");
                 }
             }
         }

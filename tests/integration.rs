@@ -240,27 +240,32 @@ fn boot_entries(im: &Image) -> Vec<(u8, u32)> {
 /// Default (keep-parent) build with auto El Torito boot: the Joliet tree
 /// shows every payload file under pkg/ with original names and byte-exact
 /// content; the boot entry targets the boot file; base namespace readable.
+
+/// Every payload file goes into the FAT container (esp.img) verbatim —
+/// original paths, no injected boot file. El Torito points at esp.img.
+/// Default (no --no-eltorito) means esp.img is ALWAYS generated, whether or
+/// not the payload contains any boot program.
 #[test]
-fn keep_parent_auto_boot() {
+fn default_keep_parent_packs_esp() {
     let fx = Fx::new();
     let payload = sorted_payload(&fx);
-    fx.file("EFI/BOOT/BOOTX64.EFI", b"fake efi boot image\n");
+    fx.file("EFI/BOOT/BOOTX64.EFI", b"a user-provided efi\n"); // treated as plain data
     let out = fx.dir.join("out.iso");
     let sum = build_iso(&out, &[fx.pkg.clone()], &Options::default()).unwrap();
+    assert!(sum.bootable);
     assert_eq!(sum.files, payload.len() as u64 + 1);
-    assert_eq!(sum.boot_path.as_deref(), Some("pkg/EFI/BOOT/BOOTX64.EFI"));
 
     let im = parse_image(&out);
-    assert!(joliet_lba(&im).is_some(), "joliet SVD present");
     let jol = walk(&im.img, joliet_lba(&im).unwrap() * S, true);
 
+    // ISO9660(+Joliet) data tree: payload under pkg/, plus engine artifacts
     let mut expected: Vec<(String, Vec<u8>)> = payload
         .iter()
         .map(|(rel, data)| (format!("pkg/{}", rel), data.clone()))
         .collect();
     expected.push((
         "pkg/EFI/BOOT/BOOTX64.EFI".to_string(),
-        b"fake efi boot image\n".to_vec(),
+        b"a user-provided efi\n".to_vec(),
     ));
     for (rel, data) in &expected {
         let (_, size, ext) = jol
@@ -270,43 +275,28 @@ fn keep_parent_auto_boot() {
         assert_eq!(size, data.len() as u64, "size of {}", rel);
         assert_eq!(&content(&im.img, ext, size), data, "content of {}", rel);
     }
-    let files: Vec<String> = jol
+    let jfiles: Vec<String> = jol
         .iter()
         .filter(|(_, (d, _, _))| !*d)
         .map(|(k, _)| k.clone())
-        .filter(|k| k != "boot.catalog" && k != "esp.img") // engine artifacts
+        .filter(|k| k != "boot.catalog" && k != "esp.img")
         .collect();
-    assert_eq!(files.len(), expected.len(), "joliet file set: {:?}", files);
+    assert_eq!(jfiles.len(), expected.len(), "{:?}", jfiles);
 
-    // base namespace readable with unique identifiers
-    let base = walk(&im.img, im.pvd_lba * S, false);
-    let base_files: Vec<String> = base
-        .iter()
-        .filter(|(_, (d, _, _))| !*d)
-        .map(|(k, _)| k.clone())
-        .collect();
-    assert_eq!(
-        base_files.len(),
-        payload.len() + 3,
-        "payload + bootx64 + boot.catalog + esp.img"
-    );
-    let uniq: std::collections::HashSet<_> = base_files.iter().collect();
-    assert_eq!(uniq.len(), base_files.len());
-
-    // El Torito entry points at the generated FAT container (esp.img), which
-    // mirrors the payload and carries the standard boot path.
-    let (_, esp_size, esp_ext) = jol
-        .get("esp.img")
-        .copied()
-        .expect("generated esp.img present");
-    let esp = content(&im.img, esp_ext, esp_size);
+    // El Torito points at esp.img
+    let (_, esp_size, esp_ext) = jol.get("esp.img").copied().expect("esp.img present");
     assert!(esp_size > 0);
-    assert_eq!(&esp[510..512], &[0x55, 0xAA], "FAT boot signature");
+    assert_eq!(&content(&im.img, esp_ext, esp_size)[510..512], &[0x55, 0xAA]);
+    assert!(
+        boot_entries(&im)
+            .iter()
+            .any(|(m, rba)| *m == 0 && *rba == esp_ext),
+        "El Torito entry at esp.img"
+    );
 
-    // read the ESP back through fatfs: every payload file (under pkg/) plus
-    // the standard EFI/BOOT/BOOTX64.EFI boot entry must be present
-    let fs =
-        fatfs::FileSystem::new(std::io::Cursor::new(esp), fatfs::FsOptions::new()).unwrap();
+    // FAT read-back: esp.img == payload, verbatim, no additions
+    let esp = content(&im.img, esp_ext, esp_size);
+    let fs = fatfs::FileSystem::new(std::io::Cursor::new(esp), fatfs::FsOptions::new()).unwrap();
     let mut actual: Vec<String> = Vec::new();
     let mut pending = vec![String::new()];
     while let Some(p) = pending.pop() {
@@ -319,14 +309,10 @@ fn keep_parent_auto_boot() {
         for e in dir.iter() {
             let e = e.unwrap();
             let name = e.file_name();
-            let rel = if p.is_empty() {
-                name.clone()
-            } else {
-                format!("{}/{}", p, name)
-            };
             if name == "." || name == ".." {
                 continue;
             }
+            let rel = if p.is_empty() { name.clone() } else { format!("{}/{}", p, name) };
             if e.is_dir() {
                 pending.push(rel);
             } else {
@@ -334,30 +320,63 @@ fn keep_parent_auto_boot() {
             }
         }
     }
-    let mut want: Vec<String> = expected
-        .iter()
-        .map(|(r, _)| r.to_uppercase())
-        .collect();
-    want.push("EFI/BOOT/BOOTX64.EFI".to_string());
+    let mut want: Vec<String> = expected.iter().map(|(r, _)| r.to_uppercase()).collect();
     want.sort();
     actual.sort();
-    assert_eq!(actual, want, "ESP mirrors payload + standard boot path");
-
-    let entries = boot_entries(&im);
-    assert!(
-        entries
-            .iter()
-            .any(|(media, rba)| *media == 0 && *rba == esp_ext),
-        "boot entry at esp.img ({:?}, ext {})",
-        entries,
-        esp_ext
-    );
+    assert_eq!(actual, want, "esp.img mirrors payload exactly (no injected files)");
     assert_eq!(sum.label, "OUT");
 }
 
-/// Flat + no boot: joliet tree equals the payload exactly.
+/// --flat + esp: files at the image root, esp.img mirrors them at root.
 #[test]
-fn flat_no_boot() {
+fn flat_packs_esp_at_root() {
+    let fx = Fx::new();
+    let payload = sorted_payload(&fx);
+    let out = fx.dir.join("out.iso");
+    let opts = Options {
+        flat: true,
+        ..Options::default()
+    };
+    let sum = build_iso(&out, &[fx.pkg.clone()], &opts).unwrap();
+    assert!(sum.bootable);
+
+    let im = parse_image(&out);
+    let jol = walk(&im.img, joliet_lba(&im).unwrap() * S, true);
+    let (_, esp_size, esp_ext) = jol.get("esp.img").copied().expect("esp.img present");
+    let esp = content(&im.img, esp_ext, esp_size);
+    let fs = fatfs::FileSystem::new(std::io::Cursor::new(esp), fatfs::FsOptions::new()).unwrap();
+    let mut actual: Vec<String> = Vec::new();
+    let mut pending = vec![String::new()];
+    while let Some(p) = pending.pop() {
+        let mut dir = fs.root_dir();
+        for comp in p.split('/') {
+            if !comp.is_empty() {
+                dir = dir.open_dir(comp).unwrap();
+            }
+        }
+        for e in dir.iter() {
+            let e = e.unwrap();
+            let name = e.file_name();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let rel = if p.is_empty() { name.clone() } else { format!("{}/{}", p, name) };
+            if e.is_dir() {
+                pending.push(rel);
+            } else {
+                actual.push(rel.to_uppercase());
+            }
+        }
+    }
+    let mut want: Vec<String> = payload.iter().map(|(r, _)| r.to_uppercase()).collect();
+    want.sort();
+    actual.sort();
+    assert_eq!(actual, want, "flat esp.img mirrors payload at root");
+}
+
+/// --no-eltorito: plain ISO9660+Joliet data disc, no esp.img, no boot.
+#[test]
+fn no_eltorito_is_plain_data_disc() {
     let fx = Fx::new();
     let payload = sorted_payload(&fx);
     let out = fx.dir.join("out.iso");
@@ -367,10 +386,11 @@ fn flat_no_boot() {
         ..Options::default()
     };
     let sum = build_iso(&out, &[fx.pkg.clone()], &opts).unwrap();
-    assert!(sum.boot_path.is_none());
-
+    assert!(!sum.bootable);
     let im = parse_image(&out);
     let jol = walk(&im.img, joliet_lba(&im).unwrap() * S, true);
+    assert!(!jol.contains_key("esp.img"), "no esp.img on --no-eltorito");
+    assert!(boot_entries(&im).is_empty());
     let files: Vec<String> = jol
         .iter()
         .filter(|(_, (d, _, _))| !*d)
@@ -383,45 +403,12 @@ fn flat_no_boot() {
             .copied()
             .unwrap_or_else(|| panic!("missing {}", rel));
         assert_eq!(size, data.len() as u64);
-        assert_eq!(&content(&im.img, ext, size), data);
-    }
-    assert!(boot_entries(&im).is_empty(), "no boot requested");
-}
-
-/// Default semantics: payload is DATA. Without a boot file the build is a
-/// plain ISO9660+Joliet data disc (never an error); payload content matches
-/// byte-for-byte and no ESP/boot machinery appears.
-#[test]
-fn no_boot_defaults_to_data_disc() {
-    let fx = Fx::new();
-    let payload = sorted_payload(&fx); // no EFI/BOOT/BOOTX64.EFI anywhere
-    let out = fx.dir.join("out.iso");
-
-    let sum = build_iso(&out, &[fx.pkg.clone()], &Options::default()).unwrap();
-    assert!(sum.boot_path.is_none());
-    let im = parse_image(&out);
-    let jol = walk(&im.img, joliet_lba(&im).unwrap() * S, true);
-    assert!(!jol.contains_key("esp.img"), "no ESP on a data disc");
-    // keep-parent default: payload sits under pkg/
-    let files: Vec<String> = jol
-        .iter()
-        .filter(|(_, (d, _, _))| !*d)
-        .map(|(k, _)| k.clone())
-        .filter(|k| k != "boot.catalog" && k != "esp.img")
-        .collect();
-    assert_eq!(files.len(), payload.len(), "{:?}", files);
-    assert!(boot_entries(&im).is_empty());
-    for (rel, data) in &payload {
-        let rel = format!("pkg/{}", rel);
-        let (_, size, ext) = jol
-            .get(&rel)
-            .copied()
-            .unwrap_or_else(|| panic!("missing {}", rel));
-        assert_eq!(size, data.len() as u64);
         assert_eq!(&content(&im.img, ext, size), data, "content of {}", rel);
     }
 }
 
+/// Error paths: output overwriting a payload file and duplicate merged
+/// root names.
 #[test]
 fn error_paths() {
     let fx = Fx::new();
@@ -467,10 +454,13 @@ fn label_and_summary() {
         no_eltorito: true,
         ..Options::default()
     };
-    let sum: BuildSummary = build_iso(&out, &[fx.pkg.clone()], &opts).unwrap();
+    let sum = build_iso(&out, &[fx.pkg.clone()], &opts).unwrap();
     assert_eq!(sum.label, "MY_TOOLS_2024_");
     assert_eq!(sum.files, 9);
     assert!(sum.dirs >= 4, "dirs counted: {}", sum.dirs);
     assert!(sum.sectors > 0);
-    assert_eq!(fs::metadata(&out).unwrap().len(), sum.sectors as u64 * S as u64);
+    assert_eq!(
+        fs::metadata(&out).unwrap().len(),
+        sum.sectors as u64 * S as u64
+    );
 }
