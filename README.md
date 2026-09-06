@@ -23,6 +23,9 @@ El Torito 引导项指向 `esp.img`，固件因此会加载/暴露这个 FAT 卷
 ├── esp.img  (FAT 卷)  ← 全部文件/目录，原样
 ├── <payload...>       ← 同一份文件，ISO9660+Joliet 数据树
 └── El Torito → esp.img
+
+`esp.img` 与 `boot.catalog` 是工具内部工件，在数据树中以 ISO9660 隐藏属性
+存在——Windows 资源管理器/普通列表看不到，只显示你打包的文件。
 ```
 
 ## 用法
