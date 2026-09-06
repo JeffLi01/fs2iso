@@ -8,4 +8,5 @@ tests/efi/out_plain.iso
 tests/efi/serial.log
 tests/efi/qemu.out
 tests/efi/qemu.err
+tests/efi/vars_run.fd
 tests/efi/payload/

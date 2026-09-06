@@ -55,8 +55,8 @@ bash tests/efi/run_acceptance.sh   # QEMU+OVMF 真固件：从盘引导 → esp 
                                    # payload 文件可读 → mm 自退出码 1
 ```
 
-验收资产（OVMF + EDK2 Shell）由 `tests/efi/fetch_assets.sh` 从 Debian 软件
-包池获取（无需 github.com）。
+验收资产（OVMF 固件，内含 EFI Internal Shell，无需外部 shell）由
+`tests/efi/fetch_assets.sh` 从 Debian 软件包池获取（无需 github.com）。
 
 ## 说明
 

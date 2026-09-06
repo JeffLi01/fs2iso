@@ -1,25 +1,22 @@
 #!/bin/bash
-# QEMU + OVMF + EFI Shell functional test for fs2iso's default output.
+# QEMU + OVMF functional test for fs2iso (self-exit design).
 #
-# fs2iso's disc is a bootable EFI-shell medium: the payload is packed BOTH
-# into the ISO9660(+Joliet) data tree and into a FAT container (esp.img)
-# which the El Torito entry loads at boot. EDK2 firmware always supports
-# FAT, so the shell sees every payload file on the FAT volume after boot.
+# Method:
+#   1. fs2iso packs payload + startup.nsh into the disc. The ESP (esp.img)
+#      carries the user's files only — NO bootable .efi is needed: the Debian
+#      OVMF used here has a BUILT-IN "EFI Internal Shell" (Boot Manager).
+#   2. OVMF boots the disc alone; booting "fails" (esp.img has no boot
+#      program -> "Not Found"), but the firmware STILL maps the El Torito
+#      FAT image as an FS volume. We drive the Boot Manager with qemu
+#      monitor sendkeys: ESC -> DOWN -> ENTER selects EFI Internal Shell.
+#   3. The internal shell auto-runs startup.nsh from the ESP volume root
+#      (EDK2 shells scan filesystem roots for startup.nsh); the script checks
+#      payload files then writes the isa-debug-exit IO port via `mm`, which
+#      makes qemu self-exit with code 1.
+#   4. Verdict = process lifetime: exit 1 within the watchdog = PASS,
+#      timeout/other = FAIL. No serial polling, no force-kill.
 #
-# Method (self-exit design):
-#   1. fixture payload carries EFI/BOOT/BOOTX64.EFI (real shell), a
-#      startup.nsh (checks files, then writes the QEMU isa-debug-exit IO
-#      port via `mm`), plus marker files
-#   2. fs2iso packs it all (--flat); OVMF boots the disc ALONE (no FAT drive)
-#   3. verdict = process lifetime: exit code 1 within the watchdog = PASS,
-#      timeout / other code = FAIL. No serial polling, no force-kill.
-#
-# Images without an ESP container (--no-eltorito data discs) cannot boot a
-# shell under EDK2 (no ISO9660 data driver); the script reports SKIP for
-# them — their functional gates are cargo test + pycdlib + Windows mount.
-#
-# Usage:
-#   bash tests/efi/run_acceptance.sh
+# Usage: bash tests/efi/run_acceptance.sh
 # Env overrides: QEMU, ASSETS, FS2ISO, ISO, WATCHDOG (default 90)
 set -eu
 cd "$(dirname "$0")" || exit 1
@@ -32,19 +29,19 @@ WATCHDOG="${WATCHDOG:-90}"
 
 CODE="$ASSETS/OVMF_CODE_4M.fd"
 [ -f "$CODE" ] || CODE="$ASSETS/OVMF_CODE.fd"
-VARS="$ASSETS/OVMF_VARS_4M.fd"
-[ -f "$VARS" ] || VARS="$ASSETS/OVMF_VARS.fd"
-SHELL="$ASSETS/shellx64.efi"
-[ -f "$SHELL" ] || SHELL=$(find "$ASSETS" -iname '*.efi' | head -1)
-for f in "$CODE" "$VARS" "$SHELL"; do
-  [ -f "$f" ] || { echo "missing $f -- run tests/efi/fetch_assets.sh first"; exit 2; }
-done
+VARS_SRC="$ASSETS/OVMF_VARS_4M.fd"
+[ -f "$VARS_SRC" ] || VARS_SRC="$ASSETS/OVMF_VARS.fd"
+[ -f "$CODE" ] && [ -f "$VARS_SRC" ] || {
+  echo "missing OVMF in $ASSETS -- run tests/efi/fetch_assets.sh first"; exit 2
+}
+cp "$VARS_SRC" "$W/vars_run.fd"   # writable per-run copy
 
 rm -rf payload out.iso serial.log
-mkdir -p payload/EFI/BOOT payload/tools
-cp "$SHELL" payload/EFI/BOOT/BOOTX64.EFI
+mkdir -p payload/tools
 printf 'hello readme\n' > payload/readme.txt
 printf 'nested payload\n' > payload/tools/nested.txt
+# startup.nsh: no boot file needed anywhere — files-only payload, the ESP
+# volume shows up as fs0 in this topology and the internal shell auto-runs
 cat > payload/startup.nsh <<'NSH'
 @echo -off
 echo FS2ISO_TEST_START
@@ -66,29 +63,38 @@ if [ -z "$ISO" ]; then
 fi
 echo "== image: $ISO =="
 if ! grep -aq "ESP.IMG" "$ISO"; then
-  echo "SKIP: no FAT boot container (esp.img) in the image — EDK2 cannot boot"
-  echo "a plain ISO9660 data disc. Functional gates for --no-eltorito output:"
-  echo "cargo test, pycdlib, Windows Mount-DiskImage."
+  echo "SKIP: image has no ESP (FAT) container — nothing for an EFI shell to mount."
+  echo "(--no-eltorito data discs are validated by cargo test / pycdlib / Windows mount)"
   exit 0
 fi
 
 set +e
-timeout "$WATCHDOG" "$QEMU" -machine q35 \
+(
+  sleep 15                                   # OVMF: boot fail -> Press any key
+  echo "sendkey esc"                         # enter Boot Manager
+  sleep 4
+  echo "sendkey down"                        # highlight EFI Internal Shell
+  sleep 1
+  echo "sendkey ret"
+  sleep 35                                   # internal shell boot + auto-run
+  echo "quit"
+) | timeout "$WATCHDOG" "$QEMU" -machine q35 \
   -drive if=pflash,format=raw,unit=0,file="$CODE",readonly=on \
-  -drive if=pflash,format=raw,unit=1,file="$VARS" \
+  -drive if=pflash,format=raw,unit=1,file="$W/vars_run.fd" \
   -drive file="$ISO",format=raw,media=cdrom \
   -device isa-debug-exit,iobase=0x510,iosize=2 \
-  -m 256 -display none -serial file:serial.log -monitor none -no-reboot \
+  -m 512 -display none -monitor stdio -serial file:serial.log -no-reboot \
   >qemu.out 2>qemu.err
 RC=$?
 set -e
+rm -f "$W/vars_run.fd"
 echo "== qemu exit code: $RC (watchdog=$WATCHDOG s) =="
-tr -d '\000' < serial.log 2>/dev/null | grep -aE "FS2ISO_TEST|FS_MOUNT_OK|hello readme|nested payload|mm:" | head -8 || true
+tr -d '\000' < serial.log 2>/dev/null | grep -aE "FS2ISO_TEST|FS_MOUNT_OK|hello readme|nested payload|UEFI Interactive|mm:" | head -10 || true
 if [ "$RC" = 1 ]; then
   echo "ACCEPTANCE PASS (self-exit code 1)"
   exit 0
 elif [ "$RC" = 124 ]; then
-  echo "ACCEPTANCE FAIL: watchdog timeout (media did not boot / startup.nsh not reached)"
+  echo "ACCEPTANCE FAIL: watchdog timeout (internal shell not reached / volume not mounted)"
   exit 1
 else
   echo "ACCEPTANCE FAIL: qemu exited with unexpected code $RC"
