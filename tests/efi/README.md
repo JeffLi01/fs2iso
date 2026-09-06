@@ -1,61 +1,47 @@
-# QEMU + OVMF + EFI Shell functional test (self-exit design)
+# QEMU + OVMF + EFI Shell functional test
 
-Real-firmware (EDK2/OVMF) test gate for fs2iso images, driven by the EFI
-shell's auto-run of `startup.nsh` and QEMU's `isa-debug-exit` device.
+Real-firmware gate for fs2iso's default output — a **bootable EFI-shell
+disc** (payload in the ISO9660 data tree AND in a FAT container `esp.img`
+that El Torito loads at boot).
 
-## Method
+## Method (self-exit design)
 
-1. The harness builds a payload that includes `startup.nsh`; **fs2iso packs it
-   into the ISO under test** (startup.nsh lands at the ISO root).
-2. OVMF boots a real EDK2 shell from a minimal FAT drive (shell only, no
-   startup.nsh). The shell scans filesystem roots and **auto-runs the
-   startup.nsh found on the ISO**.
-3. The script mounts the CD (`fs1:`), checks a marker file and, on success,
-   writes the debug-exit IO port with the shell's `mm` command:
-   `mm -io 0x510 0x00 -w 2` (note: `-w` is in **bytes**; the address must be
-   aligned to the access width — 0x501/16-bit fails, 0x510/16-bit works).
-   QEMU then self-exits with code `(0<<1)|1 = 1`.
-4. **Verdict from process lifetime alone**: exit code 1 within the watchdog
-   timeout = PASS; timeout or any other code = FAIL. No serial polling, no
-   force-kill.
+1. Fixture payload: `EFI/BOOT/BOOTX64.EFI` (real EDK2 shell), `startup.nsh`
+   (checks payload files, then writes the QEMU debug-exit port), marker files.
+2. `fs2iso --flat` packs everything. OVMF boots **the disc alone** (no helper
+   FAT drive). The firmware loads `esp.img` (FAT), the shell starts with the
+   FAT volume as `fs0:` and auto-runs `startup.nsh` from its root — i.e. the
+   shell reads the payload files.
+3. `startup.nsh` ends with `mm -io 0x510 0x00 -w 2` → qemu's
+   `isa-debug-exit` device → qemu self-exits with code 1.
+4. **Verdict from process lifetime alone**: exit 1 within the watchdog =
+   PASS; timeout or any other code = FAIL. No serial polling, no force-kill.
 
-## Verified format facts (QEMU 11 + Debian OVMF/efi-shell 2026.05, and host
-## Windows 11 Mount-DiskImage control experiments)
+Known quirks (calibrated):
+- EDK2 `mm -w` is in **bytes** (`-w 2` = 16-bit); address must be aligned to
+  the width (`0x510` works, odd `0x501` errors).
+- qemu self-exit via isa-debug-exit does NOT flush `-serial file:` (0 bytes);
+  verdicts rely on the exit code only. Timeout (killed) runs DO keep the log,
+  which covers debugging.
+- A foreground qemu call must be guarded with `set +e`/`RC=$?`/`set -e` in a
+  `set -e` script — exit code 1 (the PASS signal) would abort it otherwise.
 
-| media | this EDK2 gate | Windows 11 mount |
+## Verified facts (QEMU 11 + Debian OVMF/efi-shell 2026.05 + Windows 11)
+
+| media | EDK2/OVMF (boots the disc) | Windows mount |
 |---|---|---|
-| pure ISO9660 (fs2iso default, ISO9660+Joliet) | **SKIP** — EDK2 has no ISO9660 data driver, the media can never mount (timeout is the expected outcome, not an image bug) | ✅ mounts, files listed (CDFS; Explorer prefers Joliet originals) |
-| UDF bridge (hadris-cd UDF enabled, git 9f17b72) | ✅ PASS (mounts, `type` reads, self-exit 1) | ❌ unreadable (udfs.sys rejects hadris-cd's incomplete UDF — missing ECMA-167 file-set terminator) |
+| fs2iso default (ISO9660+Joliet + FAT esp.img) | ✅ boots → shell → payload files readable on fs0 (PASS) | ✅ data tree lists payload + esp.img/boot.catalog artifacts |
+| plain ISO9660 (--no-eltorito) | SKIP: EDK2 has no ISO9660 data driver; nothing to boot | ✅ data tree lists payload |
+| UDF bridge (historical, git 9f17b72) | ✅ fsX mount | ❌ udfs.sys rejects hadris-cd's incomplete UDF |
 
-No single namespace satisfies both an EDK2 shell and Windows' strict UDF
-driver with hadris-cd's current UDF writer, hence the default output is
-ISO9660+Joliet (Windows + mainstream AMI-class BMC firmware). This gate's
-full run applies to UDF / bootable-ESP variants of the image.
-
-## Setup
-
-1. `bash tests/efi/fetch_assets.sh` — downloads Debian `ovmf-generic` and
-   `efi-shell-x64` packages and extracts OVMF + Shell binaries into
-   `tests/efi/assets/` (gitignored; ~7 MB).
-2. qemu-system-x86_64 installed (tested with 11.x) and
-   `cargo build --release`.
-
-## Run
+## Setup & run
 
 ```bash
-bash tests/efi/run_acceptance.sh              # default fs2iso output -> SKIP note
-ISO=/path/to/udf_or_esp.iso bash tests/efi/run_acceptance.sh
+bash tests/efi/fetch_assets.sh    # OVMF + shell from Debian pool -> assets/
+cargo build --release
+bash tests/efi/run_acceptance.sh  # builds fixture, boots, expects exit 1
 ```
 
-Env overrides: `FS2ISO`, `QEMU`, `ASSETS`, `ISO`, `WATCHDOG` (s, default 90).
-Serial log is kept at `tests/efi/serial.log` for diagnostics only — verdicts
-never parse it.
-
-## Notes
-
-- EDK2 shell startup.nsh auto-run scans filesystem roots: FAT may hold only
-  the shell; the startup.nsh on the ISO executes even though the shell booted
-  from the FAT drive.
-- El Torito *direct-.efi* boot entries are not bootable under EDK2 (OVMF:
-  "failed to load … Not Found"); EDK2-bootable CDs need a FAT-ESP boot image.
-- Serial charset limits Chinese display; content checks use ASCII fixtures.
+Env overrides: `FS2ISO`, `QEMU`, `ASSETS`, `ISO` (pre-built image),
+`WATCHDOG` (s, default 90). Serial kept at `tests/efi/serial.log` for
+diagnostics only.

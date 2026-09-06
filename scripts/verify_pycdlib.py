@@ -46,7 +46,7 @@ def check_namespace(vd_key, joliet):
         for f in files:
             name = f[:-2] if f.endswith(";1") else f
             rel = f"{dp}/{name}" if dp else name
-            if rel == "boot.catalog":  # engine artifact
+            if rel.lower() in ("boot.catalog", "esp.img"):  # engine artifacts
                 continue
             seen += 1
             want = key(rel, joliet)

@@ -274,7 +274,7 @@ fn keep_parent_auto_boot() {
         .iter()
         .filter(|(_, (d, _, _))| !*d)
         .map(|(k, _)| k.clone())
-        .filter(|k| k != "boot.catalog") // engine artifact
+        .filter(|k| k != "boot.catalog" && k != "esp.img") // engine artifacts
         .collect();
     assert_eq!(files.len(), expected.len(), "joliet file set: {:?}", files);
 
@@ -285,21 +285,72 @@ fn keep_parent_auto_boot() {
         .filter(|(_, (d, _, _))| !*d)
         .map(|(k, _)| k.clone())
         .collect();
-    assert_eq!(base_files.len(), payload.len() + 2, "payload + bootx64 + catalog");
+    assert_eq!(
+        base_files.len(),
+        payload.len() + 3,
+        "payload + bootx64 + boot.catalog + esp.img"
+    );
     let uniq: std::collections::HashSet<_> = base_files.iter().collect();
     assert_eq!(uniq.len(), base_files.len());
 
-    // El Torito boot entry points at the boot file extent (joliet namespace)
-    let boot_ext = jol
-        .get("pkg/EFI/BOOT/BOOTX64.EFI")
-        .map(|(_, _, e)| *e)
-        .unwrap();
+    // El Torito entry points at the generated FAT container (esp.img), which
+    // mirrors the payload and carries the standard boot path.
+    let (_, esp_size, esp_ext) = jol
+        .get("esp.img")
+        .copied()
+        .expect("generated esp.img present");
+    let esp = content(&im.img, esp_ext, esp_size);
+    assert!(esp_size > 0);
+    assert_eq!(&esp[510..512], &[0x55, 0xAA], "FAT boot signature");
+
+    // read the ESP back through fatfs: every payload file (under pkg/) plus
+    // the standard EFI/BOOT/BOOTX64.EFI boot entry must be present
+    let fs =
+        fatfs::FileSystem::new(std::io::Cursor::new(esp), fatfs::FsOptions::new()).unwrap();
+    let mut actual: Vec<String> = Vec::new();
+    let mut pending = vec![String::new()];
+    while let Some(p) = pending.pop() {
+        let mut dir = fs.root_dir();
+        for comp in p.split('/') {
+            if !comp.is_empty() {
+                dir = dir.open_dir(comp).unwrap();
+            }
+        }
+        for e in dir.iter() {
+            let e = e.unwrap();
+            let name = e.file_name();
+            let rel = if p.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", p, name)
+            };
+            if name == "." || name == ".." {
+                continue;
+            }
+            if e.is_dir() {
+                pending.push(rel);
+            } else {
+                actual.push(rel.to_uppercase());
+            }
+        }
+    }
+    let mut want: Vec<String> = expected
+        .iter()
+        .map(|(r, _)| r.to_uppercase())
+        .collect();
+    want.push("EFI/BOOT/BOOTX64.EFI".to_string());
+    want.sort();
+    actual.sort();
+    assert_eq!(actual, want, "ESP mirrors payload + standard boot path");
+
     let entries = boot_entries(&im);
     assert!(
-        entries.iter().any(|(media, rba)| *media == 0 && *rba == boot_ext),
-        "boot entry at boot file ({:?}, ext {})",
+        entries
+            .iter()
+            .any(|(media, rba)| *media == 0 && *rba == esp_ext),
+        "boot entry at esp.img ({:?}, ext {})",
         entries,
-        boot_ext
+        esp_ext
     );
     assert_eq!(sum.label, "OUT");
 }
@@ -355,11 +406,41 @@ fn explicit_boot_file() {
 
     let im = parse_image(&out);
     let jol = walk(&im.img, joliet_lba(&im).unwrap() * S, true);
-    let boot_ext = jol.get("efi/tools/shell.efi").map(|(_, _, e)| *e).unwrap();
+    let (_, _, esp_ext) = jol.get("esp.img").copied().expect("generated esp.img");
     assert!(
-        boot_entries(&im).iter().any(|(m, rba)| *m == 0 && *rba == boot_ext),
-        "boot entry at shell.efi"
+        boot_entries(&im)
+            .iter()
+            .any(|(m, rba)| *m == 0 && *rba == esp_ext),
+        "boot entry at generated esp.img"
     );
+}
+
+/// Strict mode: a default (bootable) build without any boot file must error;
+/// the same payload with --no-eltorito builds a plain data disc.
+#[test]
+fn strict_requires_boot_file() {
+    let fx = Fx::new();
+    sorted_payload(&fx); // no EFI/BOOT/BOOTX64.EFI anywhere
+    let out = fx.dir.join("out.iso");
+
+    let err = build_iso(&out, &[fx.pkg.clone()], &Options::default()).unwrap_err();
+    assert!(err.contains("no boot file"), "{}", err);
+
+    let sum = build_iso(
+        &out,
+        &[fx.pkg.clone()],
+        &Options {
+            flat: true,
+            no_eltorito: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert!(sum.boot_path.is_none());
+    let im = parse_image(&out);
+    let jol = walk(&im.img, joliet_lba(&im).unwrap() * S, true);
+    assert!(!jol.contains_key("esp.img"), "no ESP on a data disc");
+    assert!(boot_entries(&im).is_empty());
 }
 
 /// Error paths: boot file outside payload, duplicate merged root names,
@@ -402,6 +483,7 @@ fn error_paths() {
         &[a, b],
         &Options {
             flat: true,
+            no_eltorito: true,
             ..Options::default()
         },
     )
@@ -418,6 +500,7 @@ fn label_and_summary() {
     let opts = Options {
         flat: true,
         label: Some("My Tools 2024!".to_string()),
+        no_eltorito: true,
         ..Options::default()
     };
     let sum: BuildSummary = build_iso(&out, &[fx.pkg.clone()], &opts).unwrap();

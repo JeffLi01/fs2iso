@@ -1,87 +1,76 @@
 # fs2iso
 
-纯 Rust 命令行工具：把指定文件/目录打包成一个**光盘镜像（UDF bridge）**，
-经 BMC Virtual Media 挂载后，可在 UEFI 固件的 **EFI Shell**（fs0/fs1…）中
-看到并读取这些文件/目录。
+纯 Rust 命令行工具：把指定文件/目录打包成**可引导的 EFI Shell 光盘镜像**，
+经 BMC Virtual Media 挂载（设为引导设备）后，UEFI 固件引导光盘 → EFI Shell
+中直接看到并读取/运行这些文件。
 
 ```text
 fs2iso [OPTIONS] <OUTPUT.iso> <PATH>...
 ```
 
-## 输出格式：ISO9660 + Joliet（默认，实测定案）
+## 工作原理（为什么这样设计）
 
-`fs2iso` 输出 ISO9660 + Joliet 双层镜像（写入端 hadris-cd 2.3，纯 Rust，
-数据层共享）。命名空间分工：
+EDK2 系 UEFI 固件（OVMF 及多数 EDK2 血统固件）**不带 ISO9660 数据盘驱动**，
+纯 ISO9660 数据光盘在 EFI Shell 里只有 `BLK`、没有 `fsX`——这是当年"挂载后
+看不到文件"的根因（实测结论，非推测）。而 **FAT 是 UEFI 固件的通用文件系统**。
+因此 fs2iso 的产物是双份 payload：
 
-| 命名空间 | 用途 |
+| 位置 | 读者 |
 |---|---|
-| ISO9660（base，ASCII 大写） | 传统固件 / 通用光驱驱动（Windows CDFS 挂载实测 ✅） |
-| Joliet（原文件名，含中文） | Windows 资源管理器（优先显示 Joliet 原名） |
+| ISO9660 + Joliet 数据树 | Windows 资源管理器 / AMI 类固件等传统读端 |
+| **FAT 容器**（`esp.img`，El Torito 引导入口） | **EFI Shell（fs0）** —— 引导后固件把 FAT 卷挂为 fs0，payload 全部文件在此可见可运行 |
 
-**格式演进结论（全部为实测，非推测）**：早期纯 ISO9660 布局经
-QEMU+OVMF+EDK2 Shell 测试发现不可见 → 曾改用 hadris-cd 的 UDF bridge
-（EDK2 Shell 可读，QEMU 验收过）；但**该 UDF 层不完整**（缺 ECMA-167
-文件集终止描述符），EDK2 的 UdfDxe 宽容照读，**Windows udfs.sys 严格拒绝
-整卷**（实测：bridge 镜像挂出盘符但不可读，纯 ISO9660 镜像同机秒挂）。
-因此默认输出回到 ISO9660+Joliet——Windows 与主流（AMI 类）BMC 固件均可
-读；Debian-OVMF 这类缺 ISO9660 数据驱动的 EDK2 固件是例外（其 shell 只
-挂 UDF），需要 UDF bridge 变体时取 git 历史 `9f17b72`（等 UDF 写入端
-规范补齐后再考虑回归）。
+引导文件规则（面向 EFI shell 的严格默认）：自动采用 payload 里的
+`EFI/BOOT/BOOTX64.EFI`，或 `--boot-efi <file>` 显式指定；payload 中
+**没有引导文件时报错**（本工具产出的就是可引导镜像）。引导文件旁的同名
+`startup.nsh` 会随 FAT 卷在引导后自动执行（EDK2 shell 特性）——把
+`EFI/BOOT/startup.nsh` 放进 payload 即可让光盘插上即自动跑脚本。
+`--no-eltorito` 保留纯数据盘输出（不引导、不建 FAT 容器）。
 
 ## 用法
 
 ```bash
-# 打包一个目录（目录名成为镜像根下的顶层目录）
-fs2iso out.iso ./bmctools
-
-# 目录内容直接摊到镜像根（mkisofs 风格）
-fs2iso --flat out.iso ./payload/
-
-# 指定卷标
+# 打包成可引导 EFI Shell 镜像（payload 里需含 EFI/BOOT/BOOTX64.EFI 或给 --boot-efi）
+fs2iso out.iso ./bmctools                # 目录保持（镜像根 = bmctools/...）
+fs2iso --flat out.iso ./payload/         # 目录内容平铺到镜像根
 fs2iso -l BMC_TOOLS_2024 out.iso ./bmctools
-
-# 打包并启用 El Torito EFI 启动（自动识别 efi/boot/bootx64.efi）
-fs2iso out.iso ./installer
+fs2iso --boot-efi EccProbe.efi out.iso ./dir   # 显式引导文件（须在 payload 内）
+fs2iso --no-eltorito data.iso ./files    # 纯数据盘（Windows/AMI 用，不进 FAT）
 ```
 
-选项：`-l/--label`、`--flat`、`--boot-efi <file>`（显式指定镜像内启动文件，
-`--flat` 语义下可直接用磁盘路径）、`--no-eltorito`、`-q/--quiet`。
+选项：`-l/--label`、`--flat`、`--boot-efi <file>`、`--no-eltorito`、`-q/--quiet`。
 退出码：0 成功；1 运行错误；2 CLI 用法错误。
-
-安全防护：拒绝覆盖输入文件（输出路径与 payload 冲突报错）、拒绝同名
-大小写折叠冲突、检测 junction/链接目录环。
+防护：拒绝覆盖输入文件、同名大小写折叠冲突检测、junction/链接环检测。
 
 ## 构建与测试
 
 ```bash
-cargo build --release          # 产物 target/release/fs2iso.exe
-cargo test                     # 单元 + 5 集成（独立 ISO9660 读回器校验
-                               # Joliet 原名/内容逐字节、El Torito 指向、base 树）
+cargo build --release          # target/release/fs2iso.exe
+cargo test                     # 单元 + 6 集成（Joliet 原名/内容逐字节、El Torito 指向
+                               # esp.img、FAT 容器 fatfs 读回全路径比对、严格模式报错等）
 py -3 scripts/verify_pycdlib.py out.iso payload --flat   # 开发期交叉验证（非交付物）
-bash tests/efi/run_acceptance.sh   # QEMU+OVMF 真固件自退出测试：fs2iso 把 startup.nsh
-                                   # 打包进 ISO，shell 自动执行后 mm 写 isa-debug-exit
-                                   # 端口使 qemu 以退出码 1 自退出；超时即 FAIL（ISO9660
-                                   # 默认产物在 EDK2 下预期 SKIP，见 tests/efi/README）
+bash tests/efi/run_acceptance.sh   # QEMU+OVMF 真固件：单盘引导→fs0→startup.nsh 读文件
+                                   # →mm 写 isa-debug-exit 端口自退出(码1)；超时即 FAIL
 ```
 
-## 验收与已知限制（实测结论）
+验收环境资产（OVMF + EFI Shell 二进制）由 `tests/efi/fetch_assets.sh` 从
+Debian 软件包池获取（无需 github.com）。
 
-- **Windows 挂载已验收（决定性）**：`Mount-DiskImage` 对照实验——Nero/genisoimage
-  参照 ISO、旧版纯 ISO9660 产物、当前默认产物（ISO9660+Joliet）**全部正常挂载并
-  列出文件**；UDF bridge 变体被 Windows udfs.sys 拒绝（挂出盘符但卷不可读）。
-- **EDK2-OVMF 特例**：该固件 shell 无 ISO9660 数据驱动（只挂 UDF），默认产物
-  在其中有光驱设备但无 `fsX`——此为固件能力限制，非镜像缺陷（qemu 治具按
-  镜像是否含 UDF 自适应断言，见 `tests/efi/`）。
-- **El Torito 直指 .efi 的引导项在 EDK2 固件上不可引导**（OVMF 报
-  "failed to load … Not Found"）；EDK2 可引导光盘需 FAT-ESP 镜像形态。
-  Data-CD 场景（先进 Shell 再挂载）不受影响。若需"插盘即引导"，后续按
-  grub-mkrescue 风格改造 boot 段。
-- 若在实机遇到"挂载不了"，先做对照实验（同法挂一个已知良好 ISO）：参照盘
-  也失败则是宿主/虚拟光驱栈问题（幽灵盘符或 ShellHWDetection 服务），非镜像。
+## 实测结论（QEMU 11 + OVMF/edk2 shell + Windows 11）
+
+- **EFI Shell 可见性（EDK2）**：本工具默认产物单盘引导 OVMF 后，payload
+  文件在 fs0 可见可读（qemu 自退出验收 PASS）。纯 ISO9660 数据盘在该固件下
+  不可见（固件无 ISO9660 数据驱动），属固件限制。
+- **Windows 挂载**：payload 在 ISO9660 数据树，资源管理器直接列出（原名经
+  Joliet）；`esp.img`/`BOOT.CATALOG` 为工具工件。
+- **格式演进史**：纯 ISO9660 → UDF bridge（EDK2 可读但 Windows udfs.sys
+  拒绝 hadris-cd 的不完整 UDF，实测不可挂）→ **ISO9660+Joliet 数据树 +
+  FAT ESP 容器**（当前）。UDF bridge 变体在 git `9f17b72`。
 
 ## 架构
 
 - CLI：clap 4.5（derive）；payload 收集/防护/摘要：本 crate（`src/lib.rs`）
-- 写入端：**hadris-cd 2.3**（纯 Rust；ISO9660+Joliet 双层写入，数据层共享；
-  UDF 层关闭，原因见"输出格式"节）
+- ISO9660+Joliet 写入：hadris-cd 2.3（纯 Rust；UDF 关闭）
+- FAT 容器生成：fatfs 0.3（纯 Rust；容量按 payload 动态，FAT16/32），
+  `src/esp.rs`
 - 无其它运行时依赖；交付物为单一 `fs2iso.exe`

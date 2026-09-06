@@ -2,10 +2,14 @@
 name = "fs2iso"
 version = "0.1.0"
 edition = "2021"
-description = "Pure-Rust packer: pack files/directories into an ISO9660 (+Joliet, optional El Torito EFI boot) image, for BMC virtual media / UEFI shell (fs0) use"
+description = "Pure-Rust packer: pack files/directories into an ISO9660 (+Joliet, El Torito EFI boot via FAT container) image, for BMC virtual media / UEFI shell (fs0) use"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+fatfs = "0.3"
 hadris-cd = "2.3"
 hadris-iso = { version = "2.3", features = ["joliet"] }
+
+[dev-dependencies]
+fatfs = "0.3"

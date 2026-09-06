@@ -13,6 +13,8 @@
 //! collection, duplicate and overwrite guards, El Torito boot-file
 //! resolution and the build summary.
 
+mod esp;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -323,7 +325,7 @@ pub fn build_iso(
         return Err("no input paths given".to_string());
     }
 
-    let collected = collect(inputs, opts.flat)?;
+    let mut collected = collect(inputs, opts.flat)?;
 
     // refuse to clobber a payload file with the output image
     let out_canon = canonical_maybe_missing(output)?;
@@ -357,12 +359,66 @@ pub fn build_iso(
     // bridge variant lives in git history (commit 9f17b72) until the UDF
     // writer is spec-complete.
     image_options.udf.enabled = false;
-    if let Some(rel) = &boot_rel {
+
+    // === EFI-shell medium: payload goes into a FAT container too ===
+    // The disc is bootable by default: the El Torito entry loads a generated
+    // FAT image (esp.img) whose volume mirrors the ISO root and carries every
+    // payload file, so EDK2 firmware — which has no ISO9660 data driver —
+    // shows the payload in the shell as fs0 after boot. --no-eltorito keeps
+    // a plain ISO9660+Joliet data disc (no FAT, no boot entry).
+    let boot_path_out: Option<String> = if opts.no_eltorito {
+        None
+    } else {
+        let rel = match &boot_rel {
+            Some(r) => r.clone(),
+            None => {
+                return Err(
+                    "no boot file: put EFI/BOOT/BOOTX64.EFI in the payload or pass \
+                     --boot-efi <file> (this tool builds bootable EFI-shell media; \
+                     use --no-eltorito for a plain data disc)"
+                        .to_string(),
+                )
+            }
+        };
+        if collected.recs.iter().any(|r| fold(&r.rel) == "ESP.IMG") {
+            return Err(
+                "payload contains 'esp.img' which is reserved for the generated \
+                 EFI boot container; rename it"
+                    .to_string(),
+            );
+        }
+
+        // mirror every payload file into the FAT container
+        let mut esp_entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(collected.recs.len() + 1);
+        for r in &collected.recs {
+            let b = std::fs::read(&r.src)
+                .map_err(|e| format!("cannot read {:?}: {}", r.src, e))?;
+            esp_entries.push((r.rel.clone(), b));
+        }
+        // guaranteed standard boot path (wins over a mirrored same-name file)
+        const STD_BOOT: &str = "EFI/BOOT/BOOTX64.EFI";
+        let boot_bytes = esp_entries
+            .iter()
+            .find(|(pp, _)| fold(pp) == fold(STD_BOOT))
+            .or_else(|| esp_entries.iter().find(|(pp, _)| *pp == rel))
+            .map(|(_, b)| b.clone())
+            .ok_or_else(|| format!("boot file record missing: {}", rel))?;
+        if !esp_entries.iter().any(|(pp, _)| fold(pp) == fold(STD_BOOT)) {
+            esp_entries.push((STD_BOOT.to_string(), boot_bytes.clone()));
+        }
+
+        let esp_bytes = esp::build_esp(&esp_entries)?;
+        collected
+            .tree
+            .root
+            .add_file(hadris_cd::FileEntry::from_buffer("esp.img", esp_bytes));
+        collected.tree.root.sort();
+
         use hadris_iso::boot::options::{BootEntryOptions, BootOptions, BootSectionOptions};
         use hadris_iso::boot::{EmulationType, PlatformId};
         let entry = BootEntryOptions {
             load_size: None,
-            boot_image_path: rel.clone(),
+            boot_image_path: "esp.img".to_string(),
             boot_info_table: false,
             grub2_boot_info: false,
             emulation: EmulationType::NoEmulation,
@@ -377,7 +433,8 @@ pub fn build_iso(
                 entry,
             )],
         });
-    }
+        Some(rel)
+    };
 
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -399,7 +456,7 @@ pub fn build_iso(
         files: collected.recs.len() as u64,
         payload_bytes: collected.payload_bytes,
         sectors,
-        boot_path: boot_rel,
+        boot_path: boot_path_out,
     })
 }
 

@@ -93,9 +93,12 @@ fn main() {
                 );
                 println!("  label: {}", sum.label);
                 println!("  namespaces: ISO9660 + Joliet");
+                println!(
+                    "  payload also packed into a FAT boot container (esp.img)"
+                );
                 match &sum.boot_path {
                     Some(p) => println!("  El Torito EFI boot: /{}", p),
-                    None => println!("  El Torito: none (data CD)"),
+                    None => println!("  El Torito: none (data CD, --no-eltorito)"),
                 }
             }
         }
