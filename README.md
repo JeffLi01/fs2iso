@@ -58,7 +58,10 @@ cargo build --release          # 产物 target/release/fs2iso.exe
 cargo test                     # 单元 + 5 集成（独立 ISO9660 读回器校验
                                # Joliet 原名/内容逐字节、El Torito 指向、base 树）
 py -3 scripts/verify_pycdlib.py out.iso payload --flat   # 开发期交叉验证（非交付物）
-bash tests/efi/run_acceptance.sh   # QEMU+OVMF+EFI Shell 真固件验收（决定性门禁）
+bash tests/efi/run_acceptance.sh   # QEMU+OVMF 真固件自退出测试：fs2iso 把 startup.nsh
+                                   # 打包进 ISO，shell 自动执行后 mm 写 isa-debug-exit
+                                   # 端口使 qemu 以退出码 1 自退出；超时即 FAIL（ISO9660
+                                   # 默认产物在 EDK2 下预期 SKIP，见 tests/efi/README）
 ```
 
 ## 验收与已知限制（实测结论）
