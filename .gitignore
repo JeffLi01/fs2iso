@@ -4,6 +4,7 @@
 tests/efi/assets/
 tests/efi/work/
 tests/efi/out.iso
+tests/efi/out_plain.iso
 tests/efi/serial.log
 tests/efi/qemu.out
 tests/efi/qemu.err

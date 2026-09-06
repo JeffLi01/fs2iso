@@ -8,21 +8,25 @@
 fs2iso [OPTIONS] <OUTPUT.iso> <PATH>...
 ```
 
-## 为什么是 UDF bridge（三层文件系统）
+## 输出格式：ISO9660 + Joliet（默认，实测定案）
 
-真实固件实测（QEMU + OVMF + 官方 EDK2 Shell，见 `tests/efi/`）表明：
-**EDK2 系 UEFI 固件的 Shell 不带 ISO9660 数据盘驱动** —— 纯 ISO9660 光盘
-（无论由谁生成、结构多规范）挂载后只有 `BLKx`、没有 `fsX:`，文件不可见；
-它只挂载 **UDF**。因此本工具输出 **UDF bridge** 镜像，同一份文件数据上叠
-三个命名空间，覆盖三类读端：
+`fs2iso` 输出 ISO9660 + Joliet 双层镜像（写入端 hadris-cd 2.3，纯 Rust，
+数据层共享）。命名空间分工：
 
-| 命名空间 | 读端 |
+| 命名空间 | 用途 |
 |---|---|
-| ISO9660（base，ASCII 大写） | 传统 BIOS/旧固件、通用 OS 光驱驱动 |
-| Joliet（原文件名，含中文） | Windows Explorer 等 |
-| UDF | **EDK2/EFI Shell**（BMC 场景的决定性读端） |
+| ISO9660（base，ASCII 大写） | 传统固件 / 通用光驱驱动（Windows CDFS 挂载实测 ✅） |
+| Joliet（原文件名，含中文） | Windows 资源管理器（优先显示 Joliet 原名） |
 
-文件名在各命名空间规则内尽量保留原名（中文、空格、点开头、长名均可）。
+**格式演进结论（全部为实测，非推测）**：早期纯 ISO9660 布局经
+QEMU+OVMF+EDK2 Shell 测试发现不可见 → 曾改用 hadris-cd 的 UDF bridge
+（EDK2 Shell 可读，QEMU 验收过）；但**该 UDF 层不完整**（缺 ECMA-167
+文件集终止描述符），EDK2 的 UdfDxe 宽容照读，**Windows udfs.sys 严格拒绝
+整卷**（实测：bridge 镜像挂出盘符但不可读，纯 ISO9660 镜像同机秒挂）。
+因此默认输出回到 ISO9660+Joliet——Windows 与主流（AMI 类）BMC 固件均可
+读；Debian-OVMF 这类缺 ISO9660 数据驱动的 EDK2 固件是例外（其 shell 只
+挂 UDF），需要 UDF bridge 变体时取 git 历史 `9f17b72`（等 UDF 写入端
+规范补齐后再考虑回归）。
 
 ## 用法
 
@@ -57,21 +61,24 @@ py -3 scripts/verify_pycdlib.py out.iso payload --flat   # 开发期交叉验证
 bash tests/efi/run_acceptance.sh   # QEMU+OVMF+EFI Shell 真固件验收（决定性门禁）
 ```
 
-## 验收与已知限制（真实固件实测结论）
+## 验收与已知限制（实测结论）
 
-- **数据盘可见性已验收**：fs2iso 产物在 OVMF/EDK2 Shell 下挂载为 `fs1:`，
-  根目录、子目录、中文名、文件内容均可读（`tests/efi/README.md` 记录矩阵：
-  纯 ISO9660 在 EDK2 Shell 不可见，UDF bridge 可见）。
+- **Windows 挂载已验收（决定性）**：`Mount-DiskImage` 对照实验——Nero/genisoimage
+  参照 ISO、旧版纯 ISO9660 产物、当前默认产物（ISO9660+Joliet）**全部正常挂载并
+  列出文件**；UDF bridge 变体被 Windows udfs.sys 拒绝（挂出盘符但卷不可读）。
+- **EDK2-OVMF 特例**：该固件 shell 无 ISO9660 数据驱动（只挂 UDF），默认产物
+  在其中有光驱设备但无 `fsX`——此为固件能力限制，非镜像缺陷（qemu 治具按
+  镜像是否含 UDF 自适应断言，见 `tests/efi/`）。
 - **El Torito 直指 .efi 的引导项在 EDK2 固件上不可引导**（OVMF 报
   "failed to load … Not Found"）；EDK2 可引导光盘需 FAT-ESP 镜像形态。
   Data-CD 场景（先进 Shell 再挂载）不受影响。若需"插盘即引导"，后续按
   grub-mkrescue 风格改造 boot 段。
-- Windows Explorer 挂载请用能读 UDF 的读端（Win10+ 原生可读 UDF bridge）；
-  本机曾因幽灵虚拟光驱（盘符僵尸）导致任何 ISO 均 FS_NOT_READY，属宿主问题。
+- 若在实机遇到"挂载不了"，先做对照实验（同法挂一个已知良好 ISO）：参照盘
+  也失败则是宿主/虚拟光驱栈问题（幽灵盘符或 ShellHWDetection 服务），非镜像。
 
 ## 架构
 
 - CLI：clap 4.5（derive）；payload 收集/防护/摘要：本 crate（`src/lib.rs`）
-- 写入端：**hadris-cd 2.3**（纯 Rust；ISO9660+Joliet+UDF bridge 一体写入，
-  数据层共享）
+- 写入端：**hadris-cd 2.3**（纯 Rust；ISO9660+Joliet 双层写入，数据层共享；
+  UDF 层关闭，原因见"输出格式"节）
 - 无其它运行时依赖；交付物为单一 `fs2iso.exe`

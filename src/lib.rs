@@ -1,11 +1,13 @@
 //! fs2iso — pack files/directories into an optical image (BMC virtual media /
 //! UEFI shell use).
 //!
-//! The image is produced by the [`hadris_cd`] crate (pure Rust): a **UDF
-//! bridge** disc carrying three namespaces that share the same file data —
-//! ISO9660 (legacy firmware), Joliet (Windows, original names) and UDF
-//! (EDK2/UEFI shells — verified under QEMU+OVMF that EDK2 shells only mount
-//! the UDF side of such discs, not plain ISO9660 data CDs).
+//! The image is produced by the [`hadris_cd`] crate (pure Rust) as a
+//! **ISO9660 + Joliet** disc: base namespace for legacy/ISO9660-only readers,
+//! Joliet (Windows, original names incl. Chinese). UDF is intentionally
+//! disabled (see `build_iso`): hadris-cd's UDF layer is not spec-complete
+//! (missing ECMA-167 file-set terminator) — EDK2's UdfDxe reads it, but
+//! Windows' udfs.sys rejects the whole volume, so a UDF bridge would not
+//! mount on Windows at all.
 //!
 //! This crate owns the CLI-facing semantics: keep-parent / --flat payload
 //! collection, duplicate and overwrite guards, El Torito boot-file
@@ -345,6 +347,16 @@ pub fn build_iso(
     let boot_rel = resolve_boot(opts, &collected.recs)?;
     let mut image_options = OpticalImageOptions::default();
     image_options.volume_id = label.clone();
+    // UDF layer disabled: hadris-cd's UDF metadata is incomplete (missing
+    // ECMA-167 file-set terminator). EDK2's UdfDxe tolerates it (QEMU
+    // acceptance passed) but Windows' udfs.sys rejects the whole volume —
+    // verified on this host: bridge images mount as a drive but are
+    // unreadable, while ISO9660(+Joliet) images from the same writer mount
+    // fine. Default output is therefore plain ISO9660 + Joliet, which
+    // Windows and mainstream (AMI-class) BMC firmware both read. The UDF
+    // bridge variant lives in git history (commit 9f17b72) until the UDF
+    // writer is spec-complete.
+    image_options.udf.enabled = false;
     if let Some(rel) = &boot_rel {
         use hadris_iso::boot::options::{BootEntryOptions, BootOptions, BootSectionOptions};
         use hadris_iso::boot::{EmulationType, PlatformId};
