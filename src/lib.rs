@@ -297,6 +297,122 @@ pub(crate) fn sanitize_label(raw: &str) -> String {
     out
 }
 
+
+/// Mark engine-artifact files (esp.img, boot.catalog) as ISO9660 HIDDEN in
+/// both the base and Joliet directory trees, so ordinary directory listings
+/// (Windows Explorer) only show the user's own files. El Torito addressing
+/// is by sector and is unaffected by the hidden flag.
+fn hide_iso_artifacts(path: &Path) -> Result<(), String> {
+    const HIDDEN: u8 = 0b0000_0001;
+    let targets: [&str; 2] = ["esp.img", "boot.catalog"];
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("reopen {:?} for artifact hiding: {}", path, e))?;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    fn read_sec(f: &mut std::fs::File, lba: u32) -> Result<[u8; 2048], String> {
+        f.seek(SeekFrom::Start(lba as u64 * 2048)).map_err(|e| e.to_string())?;
+        let mut buf = [0u8; 2048];
+        f.read_exact(&mut buf).map_err(|e| e.to_string())?;
+        Ok(buf)
+    }
+    let le32 = |b: &[u8], o: usize| -> u32 {
+        u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    };
+
+    // locate PVD and the real Joliet SVD (escape %/E at bytes 88..90)
+    let mut pvd: Option<u32> = None;
+    let mut svd: Option<u32> = None;
+    for lba in 16u32.. {
+        let sec = read_sec(&mut f, lba)?;
+        if sec[0] == 0xFF {
+            break;
+        }
+        if &sec[1..6] != b"CD001" {
+            continue;
+        }
+        match sec[0] {
+            1 => pvd = Some(lba),
+            2 if sec[88] == b'%' && sec[89] == b'/' && sec[90] == b'E' => {
+                if svd.is_none() {
+                    svd = Some(lba)
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut hidden = 0usize;
+    for (desc, joliet) in [(pvd, false), (svd, true)] {
+        let Some(lba) = desc else { continue };
+        let sec = read_sec(&mut f, lba)?;
+        let root = &sec[156..190];
+        let ext = le32(root, 2);
+        let dlen = le32(root, 10) as usize;
+        // read the whole root directory extent and patch matching records
+        let mut dir = vec![0u8; dlen];
+        f.seek(SeekFrom::Start(ext as u64 * 2048)).map_err(|e| e.to_string())?;
+        f.read_exact(&mut dir).map_err(|e| e.to_string())?;
+        let mut pos = 0usize;
+        while pos + 33 <= dlen {
+            let ln = dir[pos] as usize;
+            if ln == 0 {
+                break;
+            }
+            if pos + ln > dlen {
+                break;
+            }
+            let rec = &dir[pos..pos + ln];
+            let idlen = rec[32] as usize;
+            let id = &rec[33..33 + idlen];
+            let name = if joliet {
+                let units: Vec<u16> = id
+                    .chunks_exact(2)
+                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .collect();
+                String::from_utf16_lossy(&units)
+            } else {
+                let raw = match id.iter().position(|&c| c == b';') {
+                    Some(i) => &id[..i],
+                    None => id,
+                };
+                String::from_utf8_lossy(raw).into_owned().to_uppercase()
+            };
+            if name.is_empty() || name == "." || name == ".." {
+                pos += ln;
+                continue;
+            }
+            let matched = targets.iter().any(|t| {
+                if joliet {
+                    name == *t
+                } else {
+                    name == t.to_uppercase()
+                }
+            });
+            if matched {
+                let flags_off = ext as u64 * 2048 + pos as u64 + 25;
+                f.seek(SeekFrom::Start(flags_off)).map_err(|e| e.to_string())?;
+                let mut byte = [0u8; 1];
+                f.read_exact(&mut byte).map_err(|e| e.to_string())?;
+                byte[0] |= HIDDEN;
+                f.seek(SeekFrom::Start(flags_off)).map_err(|e| e.to_string())?;
+                f.write_all(&byte).map_err(|e| e.to_string())?;
+                hidden += 1;
+            }
+            pos += ln;
+        }
+    }
+    if hidden == 0 {
+        return Err(format!(
+            "internal: expected to hide engine artifacts in {:?}, none found",
+            path
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // entry point
 // ---------------------------------------------------------------------------
@@ -398,6 +514,12 @@ pub fn build_iso(
         .map_err(|e| format!("cannot create {:?}: {}", output, e))?;
     OpticalImageWriter::create(file, collected.tree, image_options)
         .map_err(|e| format!("image build failed: {}", e))?;
+
+    // Engine artifacts (esp.img, boot.catalog) must not clutter the data
+    // tree the user sees: mark them hidden in both namespaces.
+    if bootable {
+        hide_iso_artifacts(output)?;
+    }
 
     let sectors = std::fs::metadata(output)
         .map(|m| m.len() / 2048)
