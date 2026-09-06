@@ -1,109 +1,77 @@
 # fs2iso
 
-纯 Rust 编写的 **ISO9660 打包器**：把指定文件/目录打包成一个 ISO 镜像，通过 BMC
-虚拟介质（Virtual Media）挂载为光驱后，可在 UEFI Shell 中直接访问其中的文件与目录
-（`map -r` 后 `fs0:` 即可看到内容），也可让镜像本身引导 EFI Shell。
-
-适用于：EFI Shell 下加载驱动/脚本/固件包、BIOS 更新、批量运维等场景。
-
-```text
-fs2iso tools.iso D:\fw\efi_tools     # 打包目录（目录按原名出现在镜像根）
-fs2iso --flat fix.iso FixPkg\        # 目录内容直接铺到镜像根
-fs2iso --boot-efi Shell.efi shell.iso Shell.efi mydir\   # 指定 EFI 启动文件
-```
-
-挂载后（BMC → 虚拟介质 → 添加 CD/DVD 镜像）在服务器 UEFI Shell 中：
-
-```text
-Shell> map -r
-Shell> fs0:
-FS0:\> dir
-```
-
-## 引擎与结构
-
-ISO 写入使用 **[isobemak](https://crates.io/crates/isobemak)**（纯 Rust，
-UEFI/BIOS El Torito 感知）。isobemak 0.4.x 存在两处规范缺陷，本工具在构建后执行
-**一致性补强 pass**（`src/iso_fix.rs`）修复：
-
-1. **路径表缺失**：isobemak 不写 ISO9660 路径表（PVD 指针为 0）。fs2iso 从最终目录
-   记录重建 Type-L/Type-M 路径表追加到卷尾并回填 PVD；
-2. **PVD 双端序字段**：卷集大小/序号/逻辑块大小/路径表大小仅写小端、大端副本为 0
-   （严格读器会拒）。fs2iso 统一改写为 LE+BE 双份一致；
-3. **El Torito validation platform**：isobemak 硬编码 0x00（x86）。启用 EFI 启动时
-   改为 **0xEF** 并重算校验和，UEFI 固件才能认目录。
-
-产物为**单一 ISO9660 命名空间**（无 Joliet/UDF）：ASCII 字符大写化，非 ASCII 字节
-（如中文 UTF-8）与空格原样保留，文件带 `;1` 版本号；目录块/文件布局按引擎生成。
-
-## 命名可见性
-
-EFI Shell / Windows 中显示的是引擎生成的名称：
-
-- 纯 ASCII 名 → 全大写（`readme.txt` → `README.TXT`；空格/点保留）；
-- 含中文等非 ASCII → 原字节保留（中文名可直接辨认）；
-- 长名不截断；重名会自动区分大小写写入，跨输入合并时的同名冲突会**明确报错**。
-
-> 引擎单命名空间意味着无法同时保留"大写规范名 + 原样小写名"两套视图；EFI 驱动与
-> Windows 读到的都是同一份名称。
-
-## 构建
-
-```text
-cargo build --release        # 产物 target/release/fs2iso.exe
-cargo test                   # 单元 + 集成测试（独立 ISO9660 读回器校验）
-```
-
-依赖 Rust 工具链（edition 2021）+ crates.io：`clap`、`isobemak`。
-
-## 用法
+纯 Rust 命令行工具：把指定文件/目录打包成一个**光盘镜像（UDF bridge）**，
+经 BMC Virtual Media 挂载后，可在 UEFI 固件的 **EFI Shell**（fs0/fs1…）中
+看到并读取这些文件/目录。
 
 ```text
 fs2iso [OPTIONS] <OUTPUT.iso> <PATH>...
 ```
 
-每个 `PATH` 按自己的名字放进镜像根：文件 → 根下文件；目录 → 根下目录（整棵子树）。
-`--flat` 时目录参数的内容并入镜像根。注意：**空目录不会出现在镜像中**（引擎按文件
-建树）；纯数据模式（不配启动文件）生成的仍是合法数据 CD。
+## 为什么是 UDF bridge（三层文件系统）
 
-| 选项 | 说明 |
-| --- | --- |
-| `-l, --label <NAME>` | 卷标（默认取输出文件名，ASCII 清洗≤32） |
-| `--flat` | 目录内容并入镜像根 |
-| `--boot-efi <FILE>` | 把 payload 内该文件作为 El Torito UEFI 启动镜像 |
-| `--no-eltorito` | 不生成 El Torito 启动记录 |
-| `-q, --quiet` | 不输出打包摘要 |
+真实固件实测（QEMU + OVMF + 官方 EDK2 Shell，见 `tests/efi/`）表明：
+**EDK2 系 UEFI 固件的 Shell 不带 ISO9660 数据盘驱动** —— 纯 ISO9660 光盘
+（无论由谁生成、结构多规范）挂载后只有 `BLKx`、没有 `fsX:`，文件不可见；
+它只挂载 **UDF**。因此本工具输出 **UDF bridge** 镜像，同一份文件数据上叠
+三个命名空间，覆盖三类读端：
 
-启动文件：不指定 `--boot-efi` 时自动识别 payload 中任意 `efi/boot/bootx64.efi`；
-`--boot-efi` 指定的文件必须已包含在输入中。El Torito 目录为 platform **0xEF**
-的 no-emulation 项，直接指向该文件（纯 ISO 形态，不生成 isohybrid/ESP FAT 包装）。
+| 命名空间 | 读端 |
+|---|---|
+| ISO9660（base，ASCII 大写） | 传统 BIOS/旧固件、通用 OS 光驱驱动 |
+| Joliet（原文件名，含中文） | Windows Explorer 等 |
+| UDF | **EDK2/EFI Shell**（BMC 场景的决定性读端） |
 
-## 已知限制
+文件名在各命名空间规则内尽量保留原名（中文、空格、点开头、长名均可）。
 
-- 单命名空间（无 Joliet/Rock Ridge/UDF）；原文件名中的小写不再单独保留
-- 空目录不落盘；payload 文件构建时整体读入内存
-- 单文件 > 4 GiB 与目录层级过深未专门处理（引擎限制）
-- 未内嵌 EFI Shell 二进制（`shell.efi` 需自备，注意 UEFI 授权）
+## 用法
 
-## 测试与验证
+```bash
+# 打包一个目录（目录名成为镜像根下的顶层目录）
+fs2iso out.iso ./bmctools
 
-- `cargo test`：单元测试 + 5 项集成测试——独立最小 ISO9660 读回器对产物全量校验：
-  每个 payload 文件名称/大小/内容一致、El Torito 条目 RBA 指向启动文件 extent、
-  validation platform=0xEF、PVD 双端序字段与路径表真实存在、错误路径
-  （启动文件不在 payload/重名/覆盖 payload 文件）、label/摘要；
-- 交叉验证（开发期，可选）：pycdlib（严格第三方解析器）全树读取与内容比对：
-  `scripts/verify_pycdlib.py out.iso <payload-dir>`。isobemak 原生产物会被
-  pycdlib 拒绝（PVD 双端序不一致），补强后通过。
+# 目录内容直接摊到镜像根（mkisofs 风格）
+fs2iso --flat out.iso ./payload/
 
-## 目录结构
+# 指定卷标
+fs2iso -l BMC_TOOLS_2024 out.iso ./bmctools
 
-```text
-src/
-  lib.rs       收集 payload → isobemak IsoImage；boot 解析；build_iso
-  iso_fix.rs   一致性补强：追加路径表、PVD 双端序、El Torito platform=EFI
-  main.rs      CLI（clap）
-tests/
-  integration.rs  独立 ISO9660 读回器端到端校验
-scripts/
-  verify_pycdlib.py  开发期 pycdlib 交叉验证（需 Python + pycdlib）
+# 打包并启用 El Torito EFI 启动（自动识别 efi/boot/bootx64.efi）
+fs2iso out.iso ./installer
 ```
+
+选项：`-l/--label`、`--flat`、`--boot-efi <file>`（显式指定镜像内启动文件，
+`--flat` 语义下可直接用磁盘路径）、`--no-eltorito`、`-q/--quiet`。
+退出码：0 成功；1 运行错误；2 CLI 用法错误。
+
+安全防护：拒绝覆盖输入文件（输出路径与 payload 冲突报错）、拒绝同名
+大小写折叠冲突、检测 junction/链接目录环。
+
+## 构建与测试
+
+```bash
+cargo build --release          # 产物 target/release/fs2iso.exe
+cargo test                     # 单元 + 5 集成（独立 ISO9660 读回器校验
+                               # Joliet 原名/内容逐字节、El Torito 指向、base 树）
+py -3 scripts/verify_pycdlib.py out.iso payload --flat   # 开发期交叉验证（非交付物）
+bash tests/efi/run_acceptance.sh   # QEMU+OVMF+EFI Shell 真固件验收（决定性门禁）
+```
+
+## 验收与已知限制（真实固件实测结论）
+
+- **数据盘可见性已验收**：fs2iso 产物在 OVMF/EDK2 Shell 下挂载为 `fs1:`，
+  根目录、子目录、中文名、文件内容均可读（`tests/efi/README.md` 记录矩阵：
+  纯 ISO9660 在 EDK2 Shell 不可见，UDF bridge 可见）。
+- **El Torito 直指 .efi 的引导项在 EDK2 固件上不可引导**（OVMF 报
+  "failed to load … Not Found"）；EDK2 可引导光盘需 FAT-ESP 镜像形态。
+  Data-CD 场景（先进 Shell 再挂载）不受影响。若需"插盘即引导"，后续按
+  grub-mkrescue 风格改造 boot 段。
+- Windows Explorer 挂载请用能读 UDF 的读端（Win10+ 原生可读 UDF bridge）；
+  本机曾因幽灵虚拟光驱（盘符僵尸）导致任何 ISO 均 FS_NOT_READY，属宿主问题。
+
+## 架构
+
+- CLI：clap 4.5（derive）；payload 收集/防护/摘要：本 crate（`src/lib.rs`）
+- 写入端：**hadris-cd 2.3**（纯 Rust；ISO9660+Joliet+UDF bridge 一体写入，
+  数据层共享）
+- 无其它运行时依赖；交付物为单一 `fs2iso.exe`

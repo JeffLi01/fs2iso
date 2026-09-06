@@ -1,21 +1,21 @@
-//! fs2iso — pack files/directories into an ISO9660 image (BMC virtual media /
+//! fs2iso — pack files/directories into an optical image (BMC virtual media /
 //! UEFI shell use).
 //!
-//! The image is produced by the [`isobemak`] crate (pure Rust, UEFI/BIOS
-//! El Torito aware). isobemak writes a single ISO9660 base namespace (ASCII
-//! names uppercased, other bytes kept as-is) and no Joliet tree; this crate
-//! supplies the CLI-facing semantics (keep-parent / --flat collection,
-//! duplicate guards, boot-file resolution, summary) and then runs a
-//! conformance pass ([`iso_fix`]) that appends ISO9660 path tables and fixes
-//! the PVD both-endian fields, which isobemak 0.4.x leaves broken.
-
-pub mod iso_fix;
+//! The image is produced by the [`hadris_cd`] crate (pure Rust): a **UDF
+//! bridge** disc carrying three namespaces that share the same file data —
+//! ISO9660 (legacy firmware), Joliet (Windows, original names) and UDF
+//! (EDK2/UEFI shells — verified under QEMU+OVMF that EDK2 shells only mount
+//! the UDF side of such discs, not plain ISO9660 data CDs).
+//!
+//! This crate owns the CLI-facing semantics: keep-parent / --flat payload
+//! collection, duplicate and overwrite guards, El Torito boot-file
+//! resolution and the build summary.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use isobemak::{
-    build_iso as isobemak_build, BootInfo, IsoImage, IsoImageFile, IsoLayoutProfile, UefiBootInfo,
+use hadris_cd::{
+    Directory, FileEntry, FileTree, OpticalImageOptions, OpticalImageWriter,
 };
 
 pub struct Options {
@@ -52,7 +52,7 @@ pub struct BuildSummary {
 }
 
 // ---------------------------------------------------------------------------
-// payload collection
+// payload collection -> hadris-cd Directory tree
 // ---------------------------------------------------------------------------
 
 struct FileRec {
@@ -61,18 +61,26 @@ struct FileRec {
 }
 
 struct Collected {
-    files: Vec<IsoImageFile>,
+    tree: FileTree,
     recs: Vec<FileRec>,
     dirs: u64,
     payload_bytes: u64,
 }
 
-fn walk_dir(
+/// ASCII-uppercased name: collision detection across merged inputs only.
+fn fold(name: &str) -> String {
+    name.chars().map(|c| c.to_ascii_uppercase()).collect()
+}
+
+/// Add a whole directory's contents to the hadris tree.
+/// `root` is the node receiving children; `iso_prefix` is the rel path of
+/// `disk_dir` inside the image (empty => contents go to the image root).
+fn add_dir_contents(
+    root: &mut Directory,
     disk_dir: &Path,
     iso_prefix: &str,
     depth: usize,
     visited: &mut std::collections::HashSet<PathBuf>,
-    out: &mut Vec<IsoImageFile>,
     recs: &mut Vec<FileRec>,
     dirs: &mut u64,
     payload: &mut u64,
@@ -104,15 +112,25 @@ fn walk_dir(
     for name in names {
         let full = disk_dir.join(&name);
         let rel = if iso_prefix.is_empty() {
-            name
+            name.clone()
         } else {
             format!("{}/{}", iso_prefix, name)
         };
-        let meta =
-            std::fs::metadata(&full).map_err(|e| format!("cannot stat {:?}: {}", full, e))?;
+        let meta = std::fs::metadata(&full).map_err(|e| format!("cannot stat {:?}: {}", full, e))?;
         if meta.is_dir() {
             *dirs += 1;
-            walk_dir(&full, &rel, depth + 1, visited, out, recs, dirs, payload)?;
+            let mut sub = Directory::new(name);
+            add_dir_contents(
+                &mut sub,
+                &full,
+                &rel,
+                depth + 1,
+                visited,
+                recs,
+                dirs,
+                payload,
+            )?;
+            root.add_subdir(sub);
         } else {
             let size = meta.len();
             *payload += size;
@@ -120,29 +138,27 @@ fn walk_dir(
                 rel: rel.clone(),
                 src: full.clone(),
             });
-            out.push(IsoImageFile {
-                source: full,
-                destination: rel,
-            });
+            let _ = size;
+            root.add_file(FileEntry::from_path(name, full));
         }
     }
     visited.remove(&canon);
     Ok(())
 }
 
-/// ASCII-uppercased name: how the engine will (approximately) render it in
-/// the ISO9660 namespace, used for collision detection across merged inputs.
-fn fold(name: &str) -> String {
-    name.chars().map(|c| c.to_ascii_uppercase()).collect()
+fn input_name(input: &Path) -> Result<String, String> {
+    Ok(input
+        .file_name()
+        .ok_or_else(|| format!("bad input path {:?}", input))?
+        .to_string_lossy()
+        .into_owned())
 }
 
 fn collect(inputs: &[PathBuf], flat: bool) -> Result<Collected, String> {
-    let mut out = Collected {
-        files: Vec::new(),
-        recs: Vec::new(),
-        dirs: 0,
-        payload_bytes: 0,
-    };
+    let mut root = Directory::root();
+    let mut recs = Vec::new();
+    let mut dirs = 0u64;
+    let mut payload = 0u64;
     let mut root_names: HashMap<String, PathBuf> = HashMap::new();
     let mut visited = std::collections::HashSet::new();
 
@@ -150,47 +166,31 @@ fn collect(inputs: &[PathBuf], flat: bool) -> Result<Collected, String> {
         let meta =
             std::fs::metadata(input).map_err(|e| format!("cannot access {:?}: {}", input, e))?;
         if !meta.is_dir() {
-            let name = input
-                .file_name()
-                .ok_or_else(|| format!("bad input path {:?}", input))?
-                .to_string_lossy()
-                .into_owned();
-            let key = fold(&name);
+            let n = input_name(input)?;
+            let key = fold(&n);
             if let Some(prev) = root_names.get(&key) {
                 return Err(format!(
                     "duplicate root name '{}' from {:?} and {:?}",
-                    name, prev, input
+                    n, prev, input
                 ));
             }
             root_names.insert(key, input.clone());
             let size = meta.len();
-            out.payload_bytes += size;
-            out.recs.push(FileRec {
-                rel: name.clone(),
+            payload += size;
+            recs.push(FileRec {
+                rel: n.clone(),
                 src: input.clone(),
             });
-            out.files.push(IsoImageFile {
-                source: input.clone(),
-                destination: name,
-            });
+            root.add_file(FileEntry::from_path(n, input.clone()));
             continue;
         }
 
-        // directory argument
         if flat {
-            let mut before = out.recs.len();
-            walk_dir(
-                input,
-                "",
-                0,
-                &mut visited,
-                &mut out.files,
-                &mut out.recs,
-                &mut out.dirs,
-                &mut out.payload_bytes,
+            let before = recs.len();
+            add_dir_contents(
+                &mut root, input, "", 0, &mut visited, &mut recs, &mut dirs, &mut payload,
             )?;
-            // the walk appended top-level entries; check root-name collisions
-            for r in &out.recs[before..] {
+            for r in &recs[before..] {
                 if !r.rel.contains('/') {
                     let key = fold(&r.rel);
                     if let Some(prev) = root_names.get(&key) {
@@ -202,40 +202,42 @@ fn collect(inputs: &[PathBuf], flat: bool) -> Result<Collected, String> {
                     root_names.insert(key, r.src.clone());
                 }
             }
-            before = out.recs.len(); // silence unused-mut style
-            let _ = before;
         } else {
-            let name = input
-                .file_name()
-                .ok_or_else(|| format!("bad input path {:?}", input))?
-                .to_string_lossy()
-                .into_owned();
-            let key = fold(&name);
+            let n = input_name(input)?;
+            let key = fold(&n);
             if let Some(prev) = root_names.get(&key) {
                 return Err(format!(
                     "duplicate root name '{}' from {:?} and {:?}",
-                    name, prev, input
+                    n, prev, input
                 ));
             }
             root_names.insert(key, input.clone());
-            out.dirs += 1;
-            walk_dir(
+            dirs += 1;
+            let mut sub = Directory::new(n.clone());
+            add_dir_contents(
+                &mut sub,
                 input,
-                &name,
+                &n,
                 0,
                 &mut visited,
-                &mut out.files,
-                &mut out.recs,
-                &mut out.dirs,
-                &mut out.payload_bytes,
+                &mut recs,
+                &mut dirs,
+                &mut payload,
             )?;
+            root.add_subdir(sub);
         }
     }
 
-    if out.files.is_empty() {
+    if recs.is_empty() {
         return Err("no files found in the inputs".to_string());
     }
-    Ok(out)
+    root.sort();
+    Ok(Collected {
+        tree: FileTree { root },
+        recs,
+        dirs,
+        payload_bytes: payload,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -258,8 +260,8 @@ fn canonical_maybe_missing(p: &Path) -> Result<PathBuf, String> {
     Ok(canonical(parent)?.join(base))
 }
 
-/// Volume labels must be printable ISO9660 a-characters; keep it simple:
-/// ASCII alnum/space kept (uppercased), everything else becomes '_'.
+/// Volume labels must be printable: ASCII alnum kept (uppercased), everything
+/// else becomes '_'. (UDF/ISO share the label.)
 pub(crate) fn sanitize_label(raw: &str) -> String {
     let mut out = String::new();
     for b in raw.bytes() {
@@ -295,7 +297,6 @@ fn resolve_boot(opts: &Options, recs: &[FileRec]) -> Result<Option<String>, Stri
                 )
             })?
     } else {
-        // auto-detect EFI/BOOT/BOOTX64.EFI anywhere in the tree
         match recs
             .iter()
             .find(|r| r.rel.to_lowercase().ends_with("efi/boot/bootx64.efi"))
@@ -342,42 +343,39 @@ pub fn build_iso(
     };
 
     let boot_rel = resolve_boot(opts, &collected.recs)?;
+    let mut image_options = OpticalImageOptions::default();
+    image_options.volume_id = label.clone();
+    if let Some(rel) = &boot_rel {
+        use hadris_iso::boot::options::{BootEntryOptions, BootOptions, BootSectionOptions};
+        use hadris_iso::boot::{EmulationType, PlatformId};
+        let entry = BootEntryOptions {
+            load_size: None,
+            boot_image_path: rel.clone(),
+            boot_info_table: false,
+            grub2_boot_info: false,
+            emulation: EmulationType::NoEmulation,
+        };
+        image_options.boot = Some(BootOptions {
+            write_boot_catalog: true,
+            default: entry.clone(),
+            entries: vec![(
+                BootSectionOptions {
+                    platform: PlatformId::UEFI,
+                },
+                entry,
+            )],
+        });
+    }
 
-    let boot_info = match &boot_rel {
-        Some(rel) => {
-            // find the local source of the boot file (engine needs the path)
-            let src = collected
-                .recs
-                .iter()
-                .find(|r| &r.rel == rel)
-                .map(|r| r.src.clone())
-                .expect("boot rel resolved from a payload file");
-            BootInfo {
-                bios_boot: None,
-                uefi_boot: Some(UefiBootInfo {
-                    boot_image: src.clone(),
-                    kernel_image: src,
-                    destination_in_iso: rel.clone(),
-                    additional_efi_boot_files: Vec::new(),
-                    grub_cfg_content: None,
-                }),
-            }
-        }
-        None => BootInfo {
-            bios_boot: None,
-            uefi_boot: None,
-        },
-    };
-
-    let image = IsoImage {
-        volume_id: Some(label.clone()),
-        files: collected.files,
-        boot_info,
-        layout_profile: IsoLayoutProfile::default(),
-    };
-
-    isobemak_build(output, &image, false).map_err(|e| format!("isobemak build failed: {}", e))?;
-    iso_fix::conform(output, boot_rel.is_some())?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(output)
+        .map_err(|e| format!("cannot create {:?}: {}", output, e))?;
+    OpticalImageWriter::create(file, collected.tree, image_options)
+        .map_err(|e| format!("image build failed: {}", e))?;
 
     let sectors = std::fs::metadata(output)
         .map(|m| m.len() / 2048)

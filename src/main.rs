@@ -92,7 +92,7 @@ fn main() {
                     sum.dirs, sum.files, mb
                 );
                 println!("  label: {}", sum.label);
-                println!("  namespaces: ISO9660");
+                println!("  namespaces: ISO9660 + Joliet + UDF");
                 match &sum.boot_path {
                     Some(p) => println!("  El Torito EFI boot: /{}", p),
                     None => println!("  El Torito: none (data CD)"),

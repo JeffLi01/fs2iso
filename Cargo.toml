@@ -7,4 +7,5 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-isobemak = "0.4.3"
+hadris-cd = "2.3"
+hadris-iso = { version = "2.3", features = ["joliet"] }

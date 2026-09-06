@@ -1,0 +1,50 @@
+#!/bin/bash
+# Fetch OVMF (edk2 build) + EFI Shell binaries for the QEMU acceptance test.
+# Sources: Debian pool edk2 packages (ovmf-generic, efi-shell-x64).
+# Output: tests/efi/assets/{OVMF_CODE_4M.fd, OVMF_VARS_4M.fd, shellx64.efi}
+set -eu
+cd "$(dirname "$0")" || exit 1
+OUT=assets
+rm -rf "$OUT"; mkdir -p "$OUT" x
+POOL="https://deb.debian.org/debian/pool/main/e/edk2"
+
+curl -sSL -m 120 "$POOL/" -o dir.html
+GEN=$(grep -oE 'ovmf-generic_[0-9][^"<]*_all\.deb' dir.html | sort -uV | tail -1)
+SHL=$(grep -oE 'efi-shell-x64_[0-9][^"<]*_all\.deb' dir.html | sort -uV | tail -1)
+echo "ovmf: $GEN"; echo "shell: $SHL"
+curl -sSL -m 300 -o ovmf.deb "$POOL/$GEN"
+curl -sSL -m 300 -o shell.deb "$POOL/$SHL"
+
+# extract .ar -> data.tar.xz -> files (python: ar + tarfile/lzma)
+py -3 - <<'PYEOF'
+import io, os, tarfile, sys
+
+def members(deb):
+    data = open(deb, 'rb').read()
+    assert data[:8] == b'!<arch>\n'
+    pos = 8
+    while pos < len(data):
+        hdr = data[pos:pos+60]
+        name = hdr[:16].decode().strip()
+        size = int(hdr[48:58].decode().strip())
+        body = data[pos+60:pos+60+size]
+        if name == 'data.tar.xz':
+            yield body
+        pos += 60 + size + (2 if size % 2 else 0)
+
+for deb in ('ovmf.deb', 'shell.deb'):
+    for body in members(deb):
+        tf = tarfile.open(fileobj=io.BytesIO(body), mode='r:xz')
+        for m in tf:
+            if not m.isfile():
+                continue
+            base = os.path.basename(m.name)
+            if base in ('OVMF_CODE_4M.fd', 'OVMF_VARS_4M.fd', 'OVMF_CODE.fd', 'OVMF_VARS.fd') or base.lower().endswith('shell.efi') or base == 'shellx64.efi':
+                out = os.path.join('assets', base)
+                with open(out, 'wb') as f:
+                    f.write(tf.extractfile(m).read())
+                print('extracted', base)
+PYEOF
+rm -rf x dir.html ovmf.deb shell.deb
+ls -la "$OUT"
+echo "assets ready"

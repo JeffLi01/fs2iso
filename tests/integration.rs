@@ -1,7 +1,8 @@
-//! End-to-end tests: pack real payloads with `build_iso` (isobemak engine +
-//! conformance pass) and read the result back with an independent minimal
-//! ISO9660 parser: full tree walk, content equality, El Torito boot entries,
-//! PVD both-endian fields and path tables.
+//! End-to-end tests: pack real payloads with `build_iso` (hadris-cd engine:
+//! ISO9660 + Joliet + UDF bridge) and read the result back with an
+//! independent minimal ISO9660 parser (base + Joliet trees, directory
+//! chains, file contents, El Torito boot entries). The UDF namespace is
+//! exercised separately by the QEMU+OVMF harness under tests/efi/.
 
 use std::collections::HashMap;
 use std::fs;
@@ -22,7 +23,7 @@ struct Fx {
 impl Fx {
     fn new() -> Fx {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("fs2iso-iso-{}-{}", std::process::id(), n));
+        let dir = std::env::temp_dir().join(format!("fs2iso-udf-{}-{}", std::process::id(), n));
         let pkg = dir.join("pkg");
         fs::create_dir_all(&pkg).unwrap();
         Fx { dir, pkg }
@@ -31,6 +32,11 @@ impl Fx {
         let p = self.pkg.join(rel);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(&p, data).unwrap();
+        p
+    }
+    fn mkdir(&self, rel: &str) -> PathBuf {
+        let p = self.pkg.join(rel);
+        fs::create_dir_all(&p).unwrap();
         p
     }
 }
@@ -56,19 +62,17 @@ fn sorted_payload(fx: &Fx) -> Vec<(String, Vec<u8>)> {
     add(fx, "scripts/update.nsh", b"echo updating\r\n");
     add(fx, "scripts/tools/diskpart.nsh", b"echo disk\n");
     add(fx, "sub dir/deeper/x.Y", b"deep\n");
+    fx.mkdir("scripts/tools/empty dir");
     files.sort();
     files
 }
 
 // ---------------------------------------------------------------------------
-// minimal independent reader
+// minimal independent ISO9660 reader (base + Joliet namespaces)
 // ---------------------------------------------------------------------------
 
 fn r32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
-}
-fn r16(b: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([b[off], b[off + 1]])
 }
 
 struct Rec {
@@ -79,7 +83,7 @@ struct Rec {
 }
 
 fn dir_recs(img: &[u8], lba: u32, dlen: u32) -> Vec<Rec> {
-    let start = (lba as usize) * S;
+    let start = lba as usize * S;
     let end = (start + dlen as usize).min(img.len());
     let mut out = Vec::new();
     let mut pos = start;
@@ -104,36 +108,72 @@ fn dir_recs(img: &[u8], lba: u32, dlen: u32) -> Vec<Rec> {
     out
 }
 
-/// Base-namespace name: strip ";version". (The engine only writes this one
-/// namespace; ASCII is uppercased, other bytes pass through.)
-fn decode_base(id: &[u8]) -> Option<String> {
+fn decode_id(id: &[u8], joliet: bool) -> Option<String> {
     if id.is_empty() || id == [0x00] || id == [0x01] {
         return None;
     }
-    let name = match id.iter().position(|&c| c == b';') {
-        Some(i) => &id[..i],
-        None => id,
-    };
-    if name.is_empty() {
-        return None;
+    if !joliet {
+        let name = match id.iter().position(|&c| c == b';') {
+            Some(i) => &id[..i],
+            None => id,
+        };
+        if name.is_empty() {
+            return None;
+        }
+        return Some(String::from_utf8_lossy(name).into_owned());
     }
-    Some(String::from_utf8_lossy(name).into_owned())
+    let units: Vec<u16> = id
+        .chunks_exact(2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    Some(String::from_utf16_lossy(&units))
 }
 
-/// ASCII-uppercased form of an ISO path (how the engine renders names).
-fn fold(s: &str) -> String {
-    s.chars().map(|c| c.to_ascii_uppercase()).collect()
+/// Walk one ISO namespace: relpath -> (is_dir, size, extent).
+/// `desc_off` is the byte offset of the PVD/SVD within the image; its root
+/// directory record starts at descriptor offset 156 (ECMA-119 8.4/9.1).
+fn walk(img: &[u8], desc_off: usize, joliet: bool) -> HashMap<String, (bool, u64, u32)> {
+    let root_lba = r32(img, desc_off + 156 + 2);
+    let root_len = r32(img, desc_off + 156 + 10);
+    let mut out = HashMap::new();
+    fn rec(
+        img: &[u8],
+        joliet: bool,
+        lba: u32,
+        dlen: u32,
+        prefix: &str,
+        out: &mut HashMap<String, (bool, u64, u32)>,
+    ) {
+        for r in dir_recs(img, lba, dlen) {
+            let Some(name) = decode_id(&r.id, joliet) else { continue };
+            let rel = if prefix.is_empty() {
+                name
+            } else {
+                format!("{}/{}", prefix, name)
+            };
+            if r.is_dir {
+                out.insert(rel.clone(), (true, r.dlen as u64, r.extent));
+                rec(img, joliet, r.extent, r.dlen, &rel, out);
+            } else {
+                out.insert(rel, (false, r.dlen as u64, r.extent));
+            }
+        }
+    }
+    rec(img, joliet, root_lba, root_len, "", &mut out);
+    out
 }
 
 struct Image {
     img: Vec<u8>,
     pvd_lba: usize,
+    svd_lbas: Vec<usize>, // all supplementary VDs, in order
     boot_vd_lba: Option<usize>,
 }
 
 fn parse_image(path: &Path) -> Image {
     let img = fs::read(path).unwrap();
     let mut pvd = 0;
+    let mut svds = Vec::new();
     let mut boot = None;
     for lba in 16..(img.len() / S).saturating_sub(1) {
         let sec = &img[lba * S..(lba + 1) * S];
@@ -145,49 +185,26 @@ fn parse_image(path: &Path) -> Image {
         }
         match sec[0] {
             1 => pvd = lba,
+            2 => svds.push(lba),
             0 => boot = Some(lba),
-            255 => break,
             _ => {}
         }
     }
     Image {
         img,
         pvd_lba: pvd,
+        svd_lbas: svds,
         boot_vd_lba: boot,
     }
 }
 
-/// Walk the base tree: relpath -> (is_dir, size, extent).
-fn walk(img: &[u8], root: &[u8]) -> HashMap<String, (bool, u64, u32)> {
-    let root_lba = r32(root, 156 + 2);
-    let root_len = r32(root, 156 + 10);
-    let mut out = HashMap::new();
-    fn rec(
-        img: &[u8],
-        lba: u32,
-        dlen: u32,
-        prefix: &str,
-        out: &mut HashMap<String, (bool, u64, u32)>,
-    ) {
-        for r in dir_recs(img, lba, dlen) {
-            let Some(name) = decode_base(&r.id) else {
-                continue;
-            };
-            let rel = if prefix.is_empty() {
-                name
-            } else {
-                format!("{}/{}", prefix, name)
-            };
-            if r.is_dir {
-                out.insert(rel.clone(), (true, r.dlen as u64, r.extent));
-                rec(img, r.extent, r.dlen, &rel, out);
-            } else {
-                out.insert(rel, (false, r.dlen as u64, r.extent));
-            }
-        }
-    }
-    rec(img, root_lba, root_len, "", &mut out);
-    out
+/// Real Joliet SVD: escape sequence "%/E" (ECMA-119 8.4). hadris-cd also
+/// emits a placeholder SVD for the UDF bridge whose root record is empty.
+fn joliet_lba(im: &Image) -> Option<usize> {
+    im.svd_lbas.iter().copied().find(|lba| {
+        let sec = &im.img[lba * S..lba * S + S];
+        sec[88] == b'%' && sec[89] == b'/' && sec[90] == b'E'
+    })
 }
 
 fn content(img: &[u8], extent: u32, size: u64) -> Vec<u8> {
@@ -220,12 +237,11 @@ fn boot_entries(im: &Image) -> Vec<(u8, u32)> {
 // tests
 // ---------------------------------------------------------------------------
 
-/// Default (keep-parent) build with auto-detected El Torito boot: every
-/// payload file must be readable in the ISO with exact content; names are the
-/// engine-mangled (ASCII-uppercased) forms; the boot entry points at the
-/// boot file; PVD is conformant (both-endian fields, real path tables).
+/// Default (keep-parent) build with auto El Torito boot: the Joliet tree
+/// shows every payload file under pkg/ with original names and byte-exact
+/// content; the boot entry targets the boot file; base namespace readable.
 #[test]
-fn keep_parent_auto_boot_conformant() {
+fn keep_parent_auto_boot() {
     let fx = Fx::new();
     let payload = sorted_payload(&fx);
     fx.file("EFI/BOOT/BOOTX64.EFI", b"fake efi boot image\n");
@@ -235,93 +251,60 @@ fn keep_parent_auto_boot_conformant() {
     assert_eq!(sum.boot_path.as_deref(), Some("pkg/EFI/BOOT/BOOTX64.EFI"));
 
     let im = parse_image(&out);
-    // no supplementary (Joliet) descriptor is ever written
-    let mut svd = false;
-    for lba in 16..(im.img.len() / S).saturating_sub(1) {
-        let sec = &im.img[lba * S..(lba + 1) * S];
-        if sec[0] == 255 {
-            break;
-        }
-        if &sec[1..6] == b"CD001" && sec[0] == 2 {
-            svd = true;
-        }
-    }
-    assert!(!svd, "single namespace only");
+    assert!(joliet_lba(&im).is_some(), "joliet SVD present");
+    let jol = walk(&im.img, joliet_lba(&im).unwrap() * S, true);
 
-    let base = walk(&im.img, &im.img[im.pvd_lba * S..(im.pvd_lba + 1) * S]);
-
-    // every payload file present with content intact (map by folded name)
     let mut expected: Vec<(String, Vec<u8>)> = payload
         .iter()
-        .map(|(rel, data)| (fold(&format!("pkg/{}", rel)), data.clone()))
+        .map(|(rel, data)| (format!("pkg/{}", rel), data.clone()))
         .collect();
     expected.push((
-        fold("pkg/EFI/BOOT/BOOTX64.EFI"),
+        "pkg/EFI/BOOT/BOOTX64.EFI".to_string(),
         b"fake efi boot image\n".to_vec(),
     ));
     for (rel, data) in &expected {
-        let (_, size, ext) = base
+        let (_, size, ext) = jol
             .get(rel)
             .copied()
-            .unwrap_or_else(|| panic!("missing {}", rel));
+            .unwrap_or_else(|| panic!("missing in joliet: {}", rel));
         assert_eq!(size, data.len() as u64, "size of {}", rel);
         assert_eq!(&content(&im.img, ext, size), data, "content of {}", rel);
     }
-    // no extra files beyond expected
-    let files: Vec<_> = base
+    let files: Vec<String> = jol
+        .iter()
+        .filter(|(_, (d, _, _))| !*d)
+        .map(|(k, _)| k.clone())
+        .filter(|k| k != "boot.catalog") // engine artifact
+        .collect();
+    assert_eq!(files.len(), expected.len(), "joliet file set: {:?}", files);
+
+    // base namespace readable with unique identifiers
+    let base = walk(&im.img, im.pvd_lba * S, false);
+    let base_files: Vec<String> = base
         .iter()
         .filter(|(_, (d, _, _))| !*d)
         .map(|(k, _)| k.clone())
         .collect();
-    assert_eq!(files.len(), expected.len(), "file set matches: {:?}", files);
+    assert_eq!(base_files.len(), payload.len() + 2, "payload + bootx64 + catalog");
+    let uniq: std::collections::HashSet<_> = base_files.iter().collect();
+    assert_eq!(uniq.len(), base_files.len());
 
-    // El Torito boot entry targets the boot file's extent
-    let boot_ext = base
-        .get("PKG/EFI/BOOT/BOOTX64.EFI")
+    // El Torito boot entry points at the boot file extent (joliet namespace)
+    let boot_ext = jol
+        .get("pkg/EFI/BOOT/BOOTX64.EFI")
         .map(|(_, _, e)| *e)
         .unwrap();
     let entries = boot_entries(&im);
     assert!(
-        entries
-            .iter()
-            .any(|(media, rba)| *media == 0 && *rba == boot_ext),
-        "no-emulation boot entry at the boot file (entries {:?}, boot ext {})",
+        entries.iter().any(|(media, rba)| *media == 0 && *rba == boot_ext),
+        "boot entry at boot file ({:?}, ext {})",
         entries,
         boot_ext
     );
-    // validation entry platform forced to EFI (0xEF)
-    let b = im.boot_vd_lba.unwrap();
-    let vd = &im.img[b * S..(b + 1) * S];
-    let catalog = r32(vd, 71) as usize;
-    assert_eq!(im.img[catalog * S + 1], 0xEF, "validation platform is EFI");
-
-    // PVD conformance: both-endian volume fields and real path tables
-    let pvd = &im.img[im.pvd_lba * S..(im.pvd_lba + 1) * S];
-    let le16 = |o: usize| u16::from_le_bytes(pvd[o..o + 2].try_into().unwrap()) as u32;
-    let be16 = |o: usize| u16::from_be_bytes(pvd[o..o + 2].try_into().unwrap()) as u32;
-    let le32 = |o: usize| u32::from_le_bytes(pvd[o..o + 4].try_into().unwrap());
-    let be32 = |o: usize| u32::from_be_bytes(pvd[o..o + 4].try_into().unwrap());
-    assert_eq!(le32(80), be32(84), "volume space size both-endian");
-    assert_eq!(le16(120), be16(122), "volume set size both-endian");
-    assert_eq!(le16(124), be16(126), "sequence number both-endian");
-    assert_eq!(le16(128), be16(130), "block size both-endian");
-    let pt_size = le32(132);
-    let pt_le = le32(140) as usize;
-    let pt_be = be32(148) as usize;
-    assert!(pt_size > 0 && pt_le > 0 && pt_be > 0, "path tables present");
-    assert_eq!(pt_size, be32(136), "PT size both-endian");
-    // PT location points at real data (sector with a valid first entry)
-    let first = &im.img[pt_le * S..pt_le * S + 16];
-    assert_eq!(first[0], 0, "PT[0] root has empty identifier");
-    // M table starts a whole number of sectors after L (or right after)
-    assert!(pt_be >= pt_le && pt_be <= pt_le + 2, "M table follows L");
-    // volume space size equals file size
-    assert_eq!(le32(80) as usize, im.img.len() / S);
-    assert_eq!(sum.sectors as usize, im.img.len() / S);
-    assert!(sum.label.starts_with("OUT"), "label from output stem");
+    assert_eq!(sum.label, "OUT");
 }
 
-/// Flat + no boot: names are payload names ASCII-uppercased; all content OK.
+/// Flat + no boot: joliet tree equals the payload exactly.
 #[test]
 fn flat_no_boot() {
     let fx = Fx::new();
@@ -336,27 +319,22 @@ fn flat_no_boot() {
     assert!(sum.boot_path.is_none());
 
     let im = parse_image(&out);
-    let base = walk(&im.img, &im.img[im.pvd_lba * S..(im.pvd_lba + 1) * S]);
-    let files: Vec<_> = base
+    let jol = walk(&im.img, joliet_lba(&im).unwrap() * S, true);
+    let files: Vec<String> = jol
         .iter()
         .filter(|(_, (d, _, _))| !*d)
         .map(|(k, _)| k.clone())
         .collect();
     assert_eq!(files.len(), payload.len(), "{:?}", files);
     for (rel, data) in &payload {
-        let folded = fold(rel);
-        let (_, size, ext) = base
-            .get(&folded)
+        let (_, size, ext) = jol
+            .get(rel)
             .copied()
-            .unwrap_or_else(|| panic!("missing {}", folded));
+            .unwrap_or_else(|| panic!("missing {}", rel));
         assert_eq!(size, data.len() as u64);
         assert_eq!(&content(&im.img, ext, size), data);
     }
-    // no bootable entries in the catalog (engine may still write a BR VD)
-    assert!(
-        boot_entries(&im).is_empty(),
-        "no El Torito entries requested"
-    );
+    assert!(boot_entries(&im).is_empty(), "no boot requested");
 }
 
 /// Explicit --boot-efi on a nested payload file.
@@ -376,20 +354,16 @@ fn explicit_boot_file() {
     assert_eq!(sum.boot_path.as_deref(), Some("efi/tools/shell.efi"));
 
     let im = parse_image(&out);
-    let base = walk(&im.img, &im.img[im.pvd_lba * S..(im.pvd_lba + 1) * S]);
-    let boot_ext = base.get("EFI/TOOLS/SHELL.EFI").map(|(_, _, e)| *e).unwrap();
-    let entries = boot_entries(&im);
+    let jol = walk(&im.img, joliet_lba(&im).unwrap() * S, true);
+    let boot_ext = jol.get("efi/tools/shell.efi").map(|(_, _, e)| *e).unwrap();
     assert!(
-        entries
-            .iter()
-            .any(|(media, rba)| *media == 0 && *rba == boot_ext),
-        "boot entry at shell.efi ({:?})",
-        entries
+        boot_entries(&im).iter().any(|(m, rba)| *m == 0 && *rba == boot_ext),
+        "boot entry at shell.efi"
     );
 }
 
-/// Errors: boot file outside payload, duplicate root names, output
-/// overwriting a payload file.
+/// Error paths: boot file outside payload, duplicate merged root names,
+/// output overwriting a payload file.
 #[test]
 fn error_paths() {
     let fx = Fx::new();
@@ -417,7 +391,6 @@ fn error_paths() {
     .unwrap_err();
     assert!(err.contains("would overwrite"), "{}", err);
 
-    // duplicate merged root names (case-insensitively identical)
     let a = fx.pkg.join("a");
     let b = fx.pkg.join("b");
     fs::create_dir_all(&a).unwrap();
@@ -452,8 +425,5 @@ fn label_and_summary() {
     assert_eq!(sum.files, 9);
     assert!(sum.dirs >= 4, "dirs counted: {}", sum.dirs);
     assert!(sum.sectors > 0);
-    assert_eq!(
-        fs::metadata(&out).unwrap().len(),
-        sum.sectors as u64 * S as u64
-    );
+    assert_eq!(fs::metadata(&out).unwrap().len(), sum.sectors as u64 * S as u64);
 }

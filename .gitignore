@@ -1,1 +1,9 @@
 /target
+
+# QEMU/EFI test assets (regenerate with tests/efi/fetch_assets.sh)
+tests/efi/assets/
+tests/efi/work/
+tests/efi/out.iso
+tests/efi/serial.log
+tests/efi/qemu.out
+tests/efi/qemu.err

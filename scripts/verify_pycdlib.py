@@ -1,123 +1,83 @@
 #!/usr/bin/env python3
-"""Development-only cross-validation of an fs2iso image with pycdlib.
+"""Cross-validation of an fs2iso image with pycdlib (development gate only,
+NOT part of the fs2iso deliverable).
 
-NOT part of the fs2iso deliverable (the tool itself is 100% Rust). Used during
-development as an independent, strict ISO9660 reader.
+Checks: ISO9660 base tree (ASCII-folded names), Joliet tree (original
+names incl. non-ASCII) and per-file byte content against a payload dir.
 
-Walks the namespace pycdlib resolves (Joliet tree when present, otherwise the
-ISO9660 base tree) and checks that every payload file is listed with the
-right size and that a couple of files read back byte-identically. Names are
-compared in the engine's rendering: original (Joliet) or ASCII-uppercased
-(isobemak base tree, non-ASCII bytes pass through).
-
-Requires: pycdlib (pip install pycdlib)  -- dev environment only.
-
-Usage:
-    python verify_pycdlib.py <image.iso> <payload-dir>
+Usage: py -3 scripts/verify_pycdlib.py <image.iso> <payload-dir> [--flat]
 """
-
-import io
 import os
 import sys
 
 import pycdlib
 
+FLAT = "--flat" in sys.argv
+args = [a for a in sys.argv[1:] if a != "--flat"]
+if len(args) != 2:
+    sys.exit("usage: verify_pycdlib.py <image.iso> <payload-dir> [--flat]")
+iso_path, payload_dir = args
 
-def has_joliet(image_path):
-    with open(image_path, "rb") as f:
-        data = f.read(64 * 2048)
-    for lba in range(16, 40):
-        sec = data[lba * 2048:(lba + 1) * 2048]
-        if len(sec) < 2048 or sec[0] == 255:
-            break
-        if sec[1:6] == b"CD001" and sec[0] == 2:
-            return True
-    return False
-
-
-def walk(iso, joliet):
-    res = {}
-
-    def rec(path):
-        children = iso.list_children(joliet_path=path) if joliet else iso.list_children(iso_path=path)
-        for child in children:
-            ident = child.file_ident
-            if ident in (b"\x00", b"\x01"):  # structural "." / ".."
-                continue
-            if joliet:
-                name = ident.decode("utf-16_be", "replace")
-            else:
-                # engine stores raw UTF-8 with ASCII uppercased + ";version"
-                name = ident.decode("utf-8", "replace").split(";")[0]
-            rel = name if path == "/" else path.lstrip("/") + "/" + name
-            res[rel] = (child.isdir, child.data_length)
-            if child.isdir:
-                rec("/" + rel)
-
-    rec("/")
-    return res
+# collect expected (relpath, bytes)
+expected = {}
+root = payload_dir.rstrip("/\\")
+for dp, _, files in os.walk(payload_dir):
+    for f in files:
+        full = os.path.join(dp, f)
+        rel = os.path.relpath(full, root).replace(os.sep, "/")
+        expected[rel] = open(full, "rb").read()
 
 
-def payload_list(root):
-    out = {}
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames.sort()
-        for fn in sorted(filenames):
-            full = os.path.join(dirpath, fn)
-            rel = os.path.relpath(full, root).replace("\\", "/")
-            out[rel] = os.path.getsize(full)
-    return out
-
-
-def main():
-    if len(sys.argv) != 3:
-        print(__doc__)
-        return 2
-    image, payload = sys.argv[1], sys.argv[2]
-    expected_raw = payload_list(payload)
-
-    iso = pycdlib.PyCdlib()
-    try:
-        iso.open(image)
-    except Exception as e:  # noqa: BLE001 - report whatever the strict parser rejects
-        print("FAIL: pycdlib could not open the image:", e)
-        return 1
-
-    joliet = has_joliet(image)
-    expected = {k.upper(): v for k, v in expected_raw.items()} if not joliet else expected_raw
-    listed = walk(iso, joliet)
-    files = {k: v[1] for k, v in listed.items() if not v[0]}
-
-    missing = set(expected) - set(files)
-    extra = set(files) - set(expected)
+def key(p, joliet):
     if not joliet:
-        extra.discard("BOOT.CATALOG")  # engine artifact when El Torito enabled
-    size_bad = [k for k in expected if files.get(k) != expected[k]]
-
-    probes = sorted(expected)[:2]
-    content_ok = True
-    for rel in probes:
-        buf = io.BytesIO()
-        try:
-            iso.get_file_from_iso_fp(buf, iso_path="/" + rel + ("" if joliet else ";1"))
-            with open(os.path.join(payload, rel.lower().replace("/", os.sep)), "rb") as f:
-                content_ok = content_ok and buf.getvalue() == f.read()
-        except Exception as e:  # noqa: BLE001
-            content_ok = False
-            print("  content probe", rel, "failed:", e)
-
-    ok = (not missing) and (not extra) and (not size_bad) and content_ok
-    print(f"image: {image}")
-    print(f"  namespace: {'Joliet' if joliet else 'ISO9660 base'} | payload files: {len(expected)}"
-          f" | listed files: {len(files)} | base entries: {len(listed)}")
-    print(f"  names match: {not missing and not extra}"
-          f" | missing: {sorted(missing)[:5]} | extra: {sorted(extra)[:5]}")
-    print(f"  sizes match: {not size_bad}")
-    print(f"  content read-back OK (n={len(probes)}): {content_ok}")
-    print("VERDICT:", "PASS" if ok else "FAIL")
-    iso.close()
-    return 0 if ok else 1
+        p = p.upper()
+    return p
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+iso = pycdlib.PyCdlib()
+iso.open(iso_path)
+problems = []
+
+
+def check_namespace(vd_key, joliet):
+    seen = 0
+    for dp, dirs, files in iso.walk(**{vd_key: "/"}):
+        dp = dp.strip("/")
+        for f in files:
+            name = f[:-2] if f.endswith(";1") else f
+            rel = f"{dp}/{name}" if dp else name
+            if rel == "boot.catalog":  # engine artifact
+                continue
+            seen += 1
+            want = key(rel, joliet)
+            hit = next((e for e in expected if key(e, joliet) == want), None)
+            if not joliet:
+                # base tree: engine normalizes non-d-characters to '_', so
+                # only structural counting (below) applies
+                continue
+            if hit is None:
+                problems.append(f"[{vd_key}] unexpected: {rel}")
+                continue
+            with iso.open_file_from_iso(**{vd_key: "/" + rel}) as fh:
+                got = fh.read()
+            if got != expected[hit]:
+                problems.append(f"[{vd_key}] content mismatch: {rel} ({len(got)} vs {len(expected[hit])} B)")
+    return seen
+
+
+n_iso = check_namespace("iso_path", joliet=False)
+n_jol = 0
+if iso.has_joliet():
+    n_jol = check_namespace("joliet_path", joliet=True)
+else:
+    problems.append("no Joliet SVD present")
+
+print(f"base files seen: {n_iso} (expected {len(expected)}), joliet files seen: {n_jol}")
+if n_iso != len(expected):
+    problems.append(f"base tree file count {n_iso} != payload {len(expected)}")
+if problems:
+    print("PROBLEMS:")
+    for p in problems[:20]:
+        print(" ", p)
+    sys.exit(1)
+print("VERDICT: PASS")
