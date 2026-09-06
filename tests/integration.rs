@@ -388,81 +388,45 @@ fn flat_no_boot() {
     assert!(boot_entries(&im).is_empty(), "no boot requested");
 }
 
-/// Explicit --boot-efi on a nested payload file.
+/// Default semantics: payload is DATA. Without a boot file the build is a
+/// plain ISO9660+Joliet data disc (never an error); payload content matches
+/// byte-for-byte and no ESP/boot machinery appears.
 #[test]
-fn explicit_boot_file() {
+fn no_boot_defaults_to_data_disc() {
     let fx = Fx::new();
-    fx.file("efi/tools/shell.efi", b"shell binary\n");
-    fx.file("data.txt", b"payload\n");
-    let out = fx.dir.join("out.iso");
-    let boot_src = fx.pkg.join("efi/tools/shell.efi");
-    let opts = Options {
-        flat: true,
-        boot_efi: Some(boot_src),
-        ..Options::default()
-    };
-    let sum = build_iso(&out, &[fx.pkg.clone()], &opts).unwrap();
-    assert_eq!(sum.boot_path.as_deref(), Some("efi/tools/shell.efi"));
-
-    let im = parse_image(&out);
-    let jol = walk(&im.img, joliet_lba(&im).unwrap() * S, true);
-    let (_, _, esp_ext) = jol.get("esp.img").copied().expect("generated esp.img");
-    assert!(
-        boot_entries(&im)
-            .iter()
-            .any(|(m, rba)| *m == 0 && *rba == esp_ext),
-        "boot entry at generated esp.img"
-    );
-}
-
-/// Strict mode: a default (bootable) build without any boot file must error;
-/// the same payload with --no-eltorito builds a plain data disc.
-#[test]
-fn strict_requires_boot_file() {
-    let fx = Fx::new();
-    sorted_payload(&fx); // no EFI/BOOT/BOOTX64.EFI anywhere
+    let payload = sorted_payload(&fx); // no EFI/BOOT/BOOTX64.EFI anywhere
     let out = fx.dir.join("out.iso");
 
-    let err = build_iso(&out, &[fx.pkg.clone()], &Options::default()).unwrap_err();
-    assert!(err.contains("no boot file"), "{}", err);
-
-    let sum = build_iso(
-        &out,
-        &[fx.pkg.clone()],
-        &Options {
-            flat: true,
-            no_eltorito: true,
-            ..Options::default()
-        },
-    )
-    .unwrap();
+    let sum = build_iso(&out, &[fx.pkg.clone()], &Options::default()).unwrap();
     assert!(sum.boot_path.is_none());
     let im = parse_image(&out);
     let jol = walk(&im.img, joliet_lba(&im).unwrap() * S, true);
     assert!(!jol.contains_key("esp.img"), "no ESP on a data disc");
+    // keep-parent default: payload sits under pkg/
+    let files: Vec<String> = jol
+        .iter()
+        .filter(|(_, (d, _, _))| !*d)
+        .map(|(k, _)| k.clone())
+        .filter(|k| k != "boot.catalog" && k != "esp.img")
+        .collect();
+    assert_eq!(files.len(), payload.len(), "{:?}", files);
     assert!(boot_entries(&im).is_empty());
+    for (rel, data) in &payload {
+        let rel = format!("pkg/{}", rel);
+        let (_, size, ext) = jol
+            .get(&rel)
+            .copied()
+            .unwrap_or_else(|| panic!("missing {}", rel));
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(&content(&im.img, ext, size), data, "content of {}", rel);
+    }
 }
 
-/// Error paths: boot file outside payload, duplicate merged root names,
-/// output overwriting a payload file.
 #[test]
 fn error_paths() {
     let fx = Fx::new();
     sorted_payload(&fx);
     let out = fx.dir.join("out.iso");
-
-    let outside = fx.dir.join("elsewhere.efi");
-    fs::write(&outside, b"x").unwrap();
-    let err = build_iso(
-        &out,
-        &[fx.pkg.clone()],
-        &Options {
-            boot_efi: Some(outside),
-            ..Options::default()
-        },
-    )
-    .unwrap_err();
-    assert!(err.contains("not part of the payload"), "{}", err);
 
     let err = build_iso(
         &fx.pkg.join("readme.txt"),

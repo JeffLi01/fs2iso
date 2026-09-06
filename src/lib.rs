@@ -1,16 +1,23 @@
-//! fs2iso — pack files/directories into an optical image (BMC virtual media /
-//! UEFI shell use).
+//! fs2iso — pack files/directories into an optical image for BMC virtual
+//! media / UEFI shell use.
 //!
-//! The image is produced by the [`hadris_cd`] crate (pure Rust) as a
-//! **ISO9660 + Joliet** disc: base namespace for legacy/ISO9660-only readers,
-//! Joliet (Windows, original names incl. Chinese). UDF is intentionally
-//! disabled (see `build_iso`): hadris-cd's UDF layer is not spec-complete
-//! (missing ECMA-167 file-set terminator) — EDK2's UdfDxe reads it, but
-//! Windows' udfs.sys rejects the whole volume, so a UDF bridge would not
-//! mount on Windows at all.
+//! The payload is DATA first: the default output is a plain **ISO9660 +
+//! Joliet** data disc (base namespace for ISO9660-only readers; Joliet keeps
+//! original names incl. Chinese) — mountable and browsable by any reader
+//! with an ISO9660 driver (Windows, AMI-class firmware shells, ...). UDF is
+//! intentionally disabled (see `build_iso`): hadris-cd's UDF layer is not
+//! spec-complete (missing ECMA-167 file-set terminator) — EDK2's UdfDxe
+//! reads it, but Windows' udfs.sys rejects the whole volume.
+//!
+//! Booting is optional and never forced: when the payload contains
+//! `EFI/BOOT/BOOTX64.EFI` (or `--boot-efi` is given) every payload file is
+//! additionally mirrored into a generated FAT image (`esp.img`, see `esp`)
+//! that the El Torito entry loads — EDK2-style firmware boots such discs and
+//! shows the payload on `fs0:`. A payload without a boot file builds a plain
+//! data disc, never an error; `--no-eltorito` suppresses boot.
 //!
 //! This crate owns the CLI-facing semantics: keep-parent / --flat payload
-//! collection, duplicate and overwrite guards, El Torito boot-file
+//! collection, duplicate and overwrite guards, optional El Torito boot-file
 //! resolution and the build summary.
 
 mod esp;
@@ -27,8 +34,6 @@ pub struct Options {
     pub label: Option<String>,
     /// mkisofs-style: directory arguments merge their *contents* into the root.
     pub flat: bool,
-    /// Explicit El Torito boot file (must be part of the payload).
-    pub boot_efi: Option<PathBuf>,
     /// Disable El Torito boot entirely.
     pub no_eltorito: bool,
 }
@@ -38,7 +43,6 @@ impl Default for Options {
         Options {
             label: None,
             flat: false,
-            boot_efi: None,
             no_eltorito: false,
         }
     }
@@ -189,7 +193,16 @@ fn collect(inputs: &[PathBuf], flat: bool) -> Result<Collected, String> {
             continue;
         }
 
-        if flat {
+        // A directory input normally keeps its name at the root
+        // (keep-parent). Unnameable paths (".", "..", filesystem roots —
+        // no file_name) merge their contents into the root instead, matching
+        // mkisofs semantics for `fs2iso out.iso .`.
+        let keep_parent = !flat
+            && match input_name(input) {
+                Ok(n) => n != "." && n != "..",
+                Err(_) => false,
+            };
+        if !keep_parent {
             let before = recs.len();
             add_dir_contents(
                 &mut root, input, "", 0, &mut visited, &mut recs, &mut dirs, &mut payload,
@@ -286,30 +299,17 @@ pub(crate) fn sanitize_label(raw: &str) -> String {
 }
 
 fn resolve_boot(opts: &Options, recs: &[FileRec]) -> Result<Option<String>, String> {
+    // Boot discovery is purely a naming convention: a payload file at any
+    // depth whose path ends in efi/boot/bootx64.efi makes the disc bootable.
+    // (Keep-parent packs a directory as-is, so e.g. `pkg/EFI/BOOT/BOOTX64.EFI`
+    // counts.) --no-eltorito disables boot even then.
     if opts.no_eltorito {
         return Ok(None);
     }
-    let rel = if let Some(bf) = &opts.boot_efi {
-        let want = canonical(bf)?;
-        recs.iter()
-            .find(|r| canonical(&r.src).map(|c| c == want).unwrap_or(false))
-            .map(|r| r.rel.clone())
-            .ok_or_else(|| {
-                format!(
-                    "--boot-efi {:?} is not part of the payload (add it as an input)",
-                    bf
-                )
-            })?
-    } else {
-        match recs
-            .iter()
-            .find(|r| r.rel.to_lowercase().ends_with("efi/boot/bootx64.efi"))
-        {
-            Some(r) => r.rel.clone(),
-            None => return Ok(None),
-        }
-    };
-    Ok(Some(rel))
+    Ok(recs
+        .iter()
+        .find(|r| r.rel.to_lowercase().ends_with("efi/boot/bootx64.efi"))
+        .map(|r| r.rel.clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -360,80 +360,78 @@ pub fn build_iso(
     // writer is spec-complete.
     image_options.udf.enabled = false;
 
-    // === EFI-shell medium: payload goes into a FAT container too ===
-    // The disc is bootable by default: the El Torito entry loads a generated
-    // FAT image (esp.img) whose volume mirrors the ISO root and carries every
-    // payload file, so EDK2 firmware — which has no ISO9660 data driver —
-    // shows the payload in the shell as fs0 after boot. --no-eltorito keeps
-    // a plain ISO9660+Joliet data disc (no FAT, no boot entry).
-    let boot_path_out: Option<String> = if opts.no_eltorito {
-        None
-    } else {
-        let rel = match &boot_rel {
-            Some(r) => r.clone(),
-            None => {
+    // === Optional boot: FAT container (esp.img) ===
+    // The payload is first and foremost DATA — a plain ISO9660+Joliet data
+    // disc is produced by default, mountable and browsable by any reader
+    // with an ISO9660 driver (Windows, AMI-class firmware shells, ...).
+    // Boot is only added when the user actually wants to boot the disc:
+    // detecting EFI/BOOT/BOOTX64.EFI in the payload (or an explicit
+    // --boot-efi). In that case every payload file is ALSO mirrored into a
+    // FAT image (esp.img) that the El Torito entry loads — EDK2-style
+    // firmware boots such discs and shows the payload on fs0. Nothing is
+    // forced: no boot file in the payload means a plain data disc, never an
+    // error. --no-eltorito suppresses boot even when a boot file exists.
+    let boot_path_out: Option<String> = match &boot_rel {
+        None => None, // data disc
+        Some(rel) => {
+            if collected.recs.iter().any(|r| fold(&r.rel) == "ESP.IMG") {
                 return Err(
-                    "no boot file: put EFI/BOOT/BOOTX64.EFI in the payload or pass \
-                     --boot-efi <file> (this tool builds bootable EFI-shell media; \
-                     use --no-eltorito for a plain data disc)"
+                    "payload contains 'esp.img' which is reserved for the generated \
+                     EFI boot container; rename it"
                         .to_string(),
-                )
+                );
             }
-        };
-        if collected.recs.iter().any(|r| fold(&r.rel) == "ESP.IMG") {
-            return Err(
-                "payload contains 'esp.img' which is reserved for the generated \
-                 EFI boot container; rename it"
-                    .to_string(),
-            );
-        }
 
-        // mirror every payload file into the FAT container
-        let mut esp_entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(collected.recs.len() + 1);
-        for r in &collected.recs {
-            let b = std::fs::read(&r.src)
-                .map_err(|e| format!("cannot read {:?}: {}", r.src, e))?;
-            esp_entries.push((r.rel.clone(), b));
-        }
-        // guaranteed standard boot path (wins over a mirrored same-name file)
-        const STD_BOOT: &str = "EFI/BOOT/BOOTX64.EFI";
-        let boot_bytes = esp_entries
-            .iter()
-            .find(|(pp, _)| fold(pp) == fold(STD_BOOT))
-            .or_else(|| esp_entries.iter().find(|(pp, _)| *pp == rel))
-            .map(|(_, b)| b.clone())
-            .ok_or_else(|| format!("boot file record missing: {}", rel))?;
-        if !esp_entries.iter().any(|(pp, _)| fold(pp) == fold(STD_BOOT)) {
-            esp_entries.push((STD_BOOT.to_string(), boot_bytes.clone()));
-        }
+            // mirror every payload file into the FAT container
+            let mut esp_entries: Vec<(String, Vec<u8>)> =
+                Vec::with_capacity(collected.recs.len() + 1);
+            for r in &collected.recs {
+                let b = std::fs::read(&r.src)
+                    .map_err(|e| format!("cannot read {:?}: {}", r.src, e))?;
+                esp_entries.push((r.rel.clone(), b));
+            }
+            // guaranteed standard boot path (wins over a mirrored same-name file)
+            const STD_BOOT: &str = "EFI/BOOT/BOOTX64.EFI";
+            let boot_bytes = esp_entries
+                .iter()
+                .find(|(pp, _)| fold(pp) == fold(STD_BOOT))
+                .or_else(|| esp_entries.iter().find(|(pp, _)| pp == rel))
+                .map(|(_, b)| b.clone())
+                .ok_or_else(|| format!("boot file record missing: {}", rel))?;
+            if !esp_entries.iter().any(|(pp, _)| fold(pp) == fold(STD_BOOT)) {
+                esp_entries.push((STD_BOOT.to_string(), boot_bytes.clone()));
+            }
 
-        let esp_bytes = esp::build_esp(&esp_entries)?;
-        collected
-            .tree
-            .root
-            .add_file(hadris_cd::FileEntry::from_buffer("esp.img", esp_bytes));
-        collected.tree.root.sort();
+            let esp_bytes = esp::build_esp(&esp_entries)?;
+            collected
+                .tree
+                .root
+                .add_file(hadris_cd::FileEntry::from_buffer("esp.img", esp_bytes));
+            collected.tree.root.sort();
 
-        use hadris_iso::boot::options::{BootEntryOptions, BootOptions, BootSectionOptions};
-        use hadris_iso::boot::{EmulationType, PlatformId};
-        let entry = BootEntryOptions {
-            load_size: None,
-            boot_image_path: "esp.img".to_string(),
-            boot_info_table: false,
-            grub2_boot_info: false,
-            emulation: EmulationType::NoEmulation,
-        };
-        image_options.boot = Some(BootOptions {
-            write_boot_catalog: true,
-            default: entry.clone(),
-            entries: vec![(
-                BootSectionOptions {
-                    platform: PlatformId::UEFI,
-                },
-                entry,
-            )],
-        });
-        Some(rel)
+            use hadris_iso::boot::options::{
+                BootEntryOptions, BootOptions, BootSectionOptions,
+            };
+            use hadris_iso::boot::{EmulationType, PlatformId};
+            let entry = BootEntryOptions {
+                load_size: None,
+                boot_image_path: "esp.img".to_string(),
+                boot_info_table: false,
+                grub2_boot_info: false,
+                emulation: EmulationType::NoEmulation,
+            };
+            image_options.boot = Some(BootOptions {
+                write_boot_catalog: true,
+                default: entry.clone(),
+                entries: vec![(
+                    BootSectionOptions {
+                        platform: PlatformId::UEFI,
+                    },
+                    entry,
+                )],
+            });
+            Some(rel.clone())
+        }
     };
 
     let file = std::fs::OpenOptions::new()

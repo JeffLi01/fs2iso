@@ -24,11 +24,7 @@ use std::path::PathBuf;
     name = "fs2iso",
     version,
     about = "Pack files/directories into an ISO 9660 image (BMC virtual media / UEFI shell)",
-    after_help = "EXAMPLES:\n    \
-        fs2iso tools.iso D:\\fw\\efi_tools        # fs0: shows efi_tools/...\n    \
-        fs2iso --flat fix.iso FixPkg/             # fs0: shows FixPkg contents directly\n    \
-        fs2iso --boot-efi Shell.efi shell.iso Shell.efi mydir/\n"
-)]
+    after_help = "EXAMPLES:\n    fs2iso tools.iso D:\\fw\\efi_tools    # data disc\n    fs2iso --flat fix.iso FixPkg/         # data disc: contents at root\n    # bootable disc: put EFI/BOOT/BOOTX64.EFI inside the payload\n")]
 struct Cli {
     /// Volume label (default: derived from the output file name)
     #[arg(short = 'l', long, value_name = "NAME")]
@@ -37,11 +33,6 @@ struct Cli {
     /// Pack directory contents into the ISO root (mkisofs style)
     #[arg(long)]
     flat: bool,
-
-    /// Use payload FILE as the El Torito EFI boot image
-    /// (auto-detected: EFI/BOOT/BOOTX64.EFI unless --no-eltorito)
-    #[arg(long, value_name = "FILE")]
-    boot_efi: Option<PathBuf>,
 
     /// Do not add an El Torito boot record at all
     #[arg(long)]
@@ -65,7 +56,6 @@ fn main() {
     let opts = Options {
         label: cli.label,
         flat: cli.flat,
-        boot_efi: cli.boot_efi,
         no_eltorito: cli.no_eltorito,
     };
 
@@ -93,12 +83,12 @@ fn main() {
                 );
                 println!("  label: {}", sum.label);
                 println!("  namespaces: ISO9660 + Joliet");
-                println!(
-                    "  payload also packed into a FAT boot container (esp.img)"
-                );
                 match &sum.boot_path {
-                    Some(p) => println!("  El Torito EFI boot: /{}", p),
-                    None => println!("  El Torito: none (data CD, --no-eltorito)"),
+                    Some(p) => println!(
+                        "  El Torito EFI boot: /{} (payload mirrored into FAT esp.img)",
+                        p
+                    ),
+                    None => println!("  boot: none (data disc)"),
                 }
             }
         }
