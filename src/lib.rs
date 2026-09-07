@@ -484,8 +484,8 @@ pub fn build_iso(
             .add_file(hadris_cd::FileEntry::from_buffer("esp.img", esp_bytes));
         collected.tree.root.sort();
 
-        use hadris_iso::boot::options::{BootEntryOptions, BootOptions, BootSectionOptions};
-        use hadris_iso::boot::{EmulationType, PlatformId};
+        use hadris_iso::boot::options::{BootEntryOptions, BootOptions};
+        use hadris_iso::boot::EmulationType;
         let entry = BootEntryOptions {
             load_size: None,
             boot_image_path: "esp.img".to_string(),
@@ -495,13 +495,11 @@ pub fn build_iso(
         };
         image_options.boot = Some(BootOptions {
             write_boot_catalog: true,
-            default: entry.clone(),
-            entries: vec![(
-                BootSectionOptions {
-                    platform: PlatformId::UEFI,
-                },
-                entry,
-            )],
+            default: entry,
+            // Single boot entry only. A second El Torito entry (an extra
+            // platform section) points at the same esp.img and makes the
+            // firmware map the FAT image twice (two FS/CDROMs in the shell).
+            entries: Vec::new(),
         });
     }
 
