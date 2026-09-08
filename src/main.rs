@@ -60,12 +60,12 @@ fn main() {
         no_eltorito: cli.no_eltorito,
     };
 
-    let ext = cli
+    let extension = cli
         .output
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    if ext != "iso" && ext != "img" {
+    if extension != "iso" && extension != "img" {
         eprintln!(
             "fs2iso: warning: output '{}' does not end in .iso/.img",
             cli.output.display()
@@ -73,19 +73,21 @@ fn main() {
     }
 
     match build_iso(&cli.output, &cli.paths, &opts) {
-        Ok(sum) => {
+        Ok(summary) => {
             if !cli.quiet {
-                let mb = sum.payload_bytes as f64 / (1024.0 * 1024.0);
-                let total_mb = sum.sectors as f64 * 2048.0 / (1024.0 * 1024.0);
-                println!("wrote {} ({:.1} MiB)", cli.output.display(), total_mb);
+                let payload_size_mib = summary.payload_bytes as f64 / (1024.0 * 1024.0);
+                let image_size_mib = summary.sectors as f64 * 2048.0 / (1024.0 * 1024.0);
+                println!("wrote {} ({:.1} MiB)", cli.output.display(), image_size_mib);
                 println!(
                     "  {} dirs, {} files, {:.2} MiB payload",
-                    sum.dirs, sum.files, mb
+                    summary.dirs, summary.files, payload_size_mib
                 );
-                println!("  label: {}", sum.label);
+                println!("  label: {}", summary.label);
                 println!("  namespaces: ISO9660 + Joliet");
-                if sum.bootable {
-                    println!("  FAT container esp.img: all payload files inside; El Torito -> esp.img");
+                if summary.bootable {
+                    println!(
+                        "  FAT container esp.img: all payload files inside; El Torito -> esp.img"
+                    );
                 } else {
                     println!("  no esp.img (data disc, --no-eltorito)");
                 }
