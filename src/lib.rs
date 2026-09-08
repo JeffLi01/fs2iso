@@ -129,16 +129,24 @@ pub fn build_iso(
     // FAT container.
     let bootable = !options.no_eltorito;
     if bootable {
-        let name_clashes_with_container = collected_payload
-            .records
-            .iter()
-            .any(|record| record.relative_path.eq_ignore_ascii_case("esp.img"));
-        if name_clashes_with_container {
-            return Err(
-                "payload contains a root-level file named 'esp.img', which is \
-                 reserved for the generated FAT container; rename it"
-                    .to_string(),
-            );
+        // Root-level payload names that collide with the engine's own
+        // artifacts are rejected up front: hadris-cd would silently rename
+        // the user's file (observed: boot.catalog -> boot_1.catalog in both
+        // trees), breaking the "files keep their names" promise and
+        // desyncing the data tree from the esp.img FAT copy.
+        const RESERVED_ARTIFACT_NAMES: [&str; 2] = ["esp.img", "boot.catalog"];
+        let clash = collected_payload.records.iter().find(|record| {
+            RESERVED_ARTIFACT_NAMES
+                .iter()
+                .any(|reserved| record.relative_path.eq_ignore_ascii_case(reserved))
+        });
+        if let Some(clash) = clash {
+            return Err(format!(
+                "payload contains a root-level file named '{}', which is reserved for an \
+                 engine artifact ({}); rename it",
+                clash.relative_path,
+                RESERVED_ARTIFACT_NAMES.join(" / ")
+            ));
         }
         let esp_container = build_esp_container(&mut collected_payload)?;
         collected_payload

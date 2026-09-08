@@ -562,6 +562,36 @@ fn case_fold_collision_inside_merged_dir_rejected() {
     assert!(err.contains("sub"), "{}", err);
 }
 
+/// Engine artifact names (esp.img, boot.catalog) are reserved at the image
+/// root of a bootable disc: hadris-cd silently renames a clashing payload
+/// file (boot.catalog -> boot_1.catalog), which would desync the data tree
+/// from the esp.img FAT copy. A plain --no-eltorito data disc has no engine
+/// artifacts, so the names stay usable there.
+#[test]
+fn engine_artifact_names_are_reserved_on_bootable_discs() {
+    let fixture = Fixture::new();
+    for reserved in ["esp.img", "boot.catalog"] {
+        fs::write(fixture.pkg.join(reserved), b"user payload").unwrap();
+    }
+    // bootable (default): root-level clashes rejected with a clear message
+    let out = fixture.dir.join("out.iso");
+    let opts = Options {
+        flat: true,
+        ..Options::default()
+    };
+    let err = build_iso(&out, std::slice::from_ref(&fixture.pkg), &opts).unwrap_err();
+    assert!(err.contains("reserved"), "{}", err);
+
+    // plain data disc: no engine artifacts, user names are fine
+    let data = fixture.dir.join("data.iso");
+    let opts = Options {
+        flat: true,
+        no_eltorito: true,
+        ..Options::default()
+    };
+    build_iso(&data, std::slice::from_ref(&fixture.pkg), &opts).unwrap();
+}
+
 /// Label cleaning and summary sanity.
 #[test]
 fn label_and_summary() {

@@ -46,7 +46,10 @@ def check_namespace(vd_key, joliet):
         for f in files:
             name = f[:-2] if f.endswith(";1") else f
             rel = f"{dp}/{name}" if dp else name
-            if rel.lower() in ("boot.catalog", "esp.img"):  # engine artifacts
+            if rel.lower() in ("boot.catalog", "esp.img") and "/" not in rel:
+                # Root-level engine artifacts (they cannot collide with user
+                # payload anymore — fs2iso reserves these names). Nested user
+                # files that merely share the name ARE validated.
                 continue
             seen += 1
             want = key(rel, joliet)
