@@ -532,6 +532,36 @@ fn error_paths() {
     assert!(err.contains("duplicate root name"), "{}", err);
 }
 
+/// Same-named subdirectory arriving from two different --flat inputs: both
+/// `a/sub` and `b/sub` contents merge into image dir `sub`, so the second
+/// one would silently clobber/merge into the first (the old collector only
+/// guarded root-level FILES, not directories or nested names). Also covers
+/// case-folding collisions: `sub/X.TXT` + `sub/x.txt` inside one image dir
+/// fold to the same ISO9660/FAT name and must reject the build.
+#[test]
+fn case_fold_collision_inside_merged_dir_rejected() {
+    let fixture = Fixture::new();
+    let a = fixture.pkg.join("a");
+    let b = fixture.pkg.join("b");
+    fs::create_dir_all(a.join("sub")).unwrap();
+    fs::create_dir_all(b.join("sub")).unwrap();
+    fs::write(a.join("sub/X.TXT"), b"1").unwrap();
+    fs::write(b.join("sub/x.txt"), b"2").unwrap();
+    let out = fixture.dir.join("out.iso");
+    let err = build_iso(
+        &out,
+        &[a, b],
+        &Options {
+            flat: true,
+            no_eltorito: true,
+            ..Options::default()
+        },
+    )
+    .unwrap_err();
+    assert!(err.contains("duplicate"), "{}", err);
+    assert!(err.contains("sub"), "{}", err);
+}
+
 /// Label cleaning and summary sanity.
 #[test]
 fn label_and_summary() {

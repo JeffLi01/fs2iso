@@ -33,6 +33,43 @@ fn ascii_upper(name: &str) -> String {
     name.chars().map(|c| c.to_ascii_uppercase()).collect()
 }
 
+/// Case-insensitive name registry, keyed by image directory path ("" = the
+/// image root). Catches two source entries folding to the same name before
+/// they reach the case-insensitive ISO9660/FAT writers — which would
+/// silently drop or clobber one file. Two distinct real directories can
+/// collide (inputs merged into one image directory, e.g. two --flat inputs
+/// each carrying `sub/X.TXT` / `sub/x.txt`), and so can two entries of one
+/// real directory on a case-sensitive filesystem (Linux-sourced payloads).
+#[derive(Default)]
+struct NameRegistry {
+    dirs: HashMap<String, HashMap<String, (String, PathBuf)>>,
+}
+
+impl NameRegistry {
+    /// Reserve `name` inside the image directory `image_dir` ("" = root).
+    /// Errors when another entry already folded to the same uppercase name.
+    fn reserve(&mut self, image_dir: &str, name: &str, source: &Path) -> Result<(), String> {
+        let folded = ascii_upper(name);
+        let names = self.dirs.entry(image_dir.to_string()).or_default();
+        if let Some((previous_name, previous_source)) = names.get(&folded) {
+            return if image_dir.is_empty() {
+                Err(format!(
+                    "duplicate root name '{}' from {:?} and {:?}",
+                    name, previous_source, source
+                ))
+            } else {
+                Err(format!(
+                    "duplicate image name '{}' in directory '{}': collides with '{}' from {:?} \
+                     (ISO9660/FAT names are case-insensitive)",
+                    name, image_dir, previous_name, previous_source
+                ))
+            };
+        }
+        names.insert(folded, (name.to_string(), source.to_path_buf()));
+        Ok(())
+    }
+}
+
 fn input_name(input: &Path) -> Result<String, String> {
     Ok(input
         .file_name()
@@ -66,7 +103,9 @@ pub(crate) fn canonical_maybe_missing(path: &Path) -> Result<PathBuf, String> {
 ///
 /// `image_prefix` is the image-relative path of `source_dir` itself
 /// (empty => its contents land in the image root). `depth` guards against
-/// runaway nesting; `visited` detects directory cycles through junctions.
+/// runaway nesting; `visited` detects directory cycles through junctions;
+/// `registry` rejects case-folding name collisions inside every image
+/// directory (files AND subdirectories).
 #[allow(clippy::too_many_arguments)]
 fn add_directory_contents(
     target_directory: &mut Directory,
@@ -74,6 +113,7 @@ fn add_directory_contents(
     image_prefix: &str,
     depth: usize,
     visited: &mut HashSet<PathBuf>,
+    registry: &mut NameRegistry,
     records: &mut Vec<FileRecord>,
     directory_count: &mut u64,
     payload_bytes: &mut u64,
@@ -110,6 +150,9 @@ fn add_directory_contents(
         } else {
             format!("{}/{}", image_prefix, entry_name)
         };
+        // This entry lands in the image directory `image_prefix` (the image
+        // path of `source_dir` itself); reserve its name there.
+        registry.reserve(image_prefix, &entry_name, &full_path)?;
         let metadata = std::fs::metadata(&full_path)
             .map_err(|e| format!("cannot stat {:?}: {}", full_path, e))?;
         if metadata.is_dir() {
@@ -121,6 +164,7 @@ fn add_directory_contents(
                 &relative_path,
                 depth + 1,
                 visited,
+                registry,
                 records,
                 directory_count,
                 payload_bytes,
@@ -146,7 +190,7 @@ pub(crate) fn collect_payload(inputs: &[PathBuf], flat: bool) -> Result<Collecte
     let mut records = Vec::new();
     let mut directory_count = 0u64;
     let mut payload_bytes = 0u64;
-    let mut root_names: HashMap<String, PathBuf> = HashMap::new();
+    let mut registry = NameRegistry::default();
     let mut visited = HashSet::new();
 
     for input in inputs {
@@ -154,14 +198,7 @@ pub(crate) fn collect_payload(inputs: &[PathBuf], flat: bool) -> Result<Collecte
             std::fs::metadata(input).map_err(|e| format!("cannot access {:?}: {}", input, e))?;
         if !metadata.is_dir() {
             let name = input_name(input)?;
-            let folded = ascii_upper(&name);
-            if let Some(previous) = root_names.get(&folded) {
-                return Err(format!(
-                    "duplicate root name '{}' from {:?} and {:?}",
-                    name, previous, input
-                ));
-            }
-            root_names.insert(folded, input.clone());
+            registry.reserve("", &name, input)?;
             payload_bytes += metadata.len();
             records.push(FileRecord {
                 relative_path: name.clone(),
@@ -181,39 +218,20 @@ pub(crate) fn collect_payload(inputs: &[PathBuf], flat: bool) -> Result<Collecte
                 Err(_) => false,
             };
         if !keep_parent {
-            let previous_count = records.len();
             add_directory_contents(
                 &mut root,
                 input,
                 "",
                 0,
                 &mut visited,
+                &mut registry,
                 &mut records,
                 &mut directory_count,
                 &mut payload_bytes,
             )?;
-            for record in &records[previous_count..] {
-                if !record.relative_path.contains('/') {
-                    let folded = ascii_upper(&record.relative_path);
-                    if let Some(previous) = root_names.get(&folded) {
-                        return Err(format!(
-                            "duplicate root name '{}' from {:?} and {:?}",
-                            record.relative_path, previous, record.source_path
-                        ));
-                    }
-                    root_names.insert(folded, record.source_path.clone());
-                }
-            }
         } else {
             let name = input_name(input)?;
-            let folded = ascii_upper(&name);
-            if let Some(previous) = root_names.get(&folded) {
-                return Err(format!(
-                    "duplicate root name '{}' from {:?} and {:?}",
-                    name, previous, input
-                ));
-            }
-            root_names.insert(folded, input.clone());
+            registry.reserve("", &name, input)?;
             directory_count += 1;
             let mut subdirectory = Directory::new(name.clone());
             add_directory_contents(
@@ -222,6 +240,7 @@ pub(crate) fn collect_payload(inputs: &[PathBuf], flat: bool) -> Result<Collecte
                 &name,
                 0,
                 &mut visited,
+                &mut registry,
                 &mut records,
                 &mut directory_count,
                 &mut payload_bytes,
@@ -240,4 +259,55 @@ pub(crate) fn collect_payload(inputs: &[PathBuf], flat: bool) -> Result<Collecte
         directory_count,
         payload_bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_rejects_root_fold_collision() {
+        let mut registry = NameRegistry::default();
+        registry
+            .reserve("", "readme.TXT", Path::new("a/readme.TXT"))
+            .unwrap();
+        let err = registry
+            .reserve("", "readme.txt", Path::new("b/readme.txt"))
+            .unwrap_err();
+        assert!(err.contains("duplicate root name"), "{}", err);
+    }
+
+    #[test]
+    fn registry_rejects_nested_fold_collision() {
+        let mut registry = NameRegistry::default();
+        registry
+            .reserve("sub", "X.TXT", Path::new("a/sub/X.TXT"))
+            .unwrap();
+        let err = registry
+            .reserve("sub", "x.txt", Path::new("b/sub/x.txt"))
+            .unwrap_err();
+        assert!(err.contains("duplicate image name"), "{}", err);
+        assert!(err.contains("directory 'sub'"), "{}", err);
+    }
+
+    #[test]
+    fn registry_rejects_dir_name_collisions_too() {
+        let mut registry = NameRegistry::default();
+        registry.reserve("", "Tools", Path::new("a/Tools")).unwrap();
+        let err = registry
+            .reserve("", "tools", Path::new("b/tools"))
+            .unwrap_err();
+        assert!(err.contains("duplicate root name"), "{}", err);
+    }
+
+    #[test]
+    fn registry_allows_same_name_in_different_dirs() {
+        let mut registry = NameRegistry::default();
+        registry
+            .reserve("a", "x.txt", Path::new("a/x.txt"))
+            .unwrap();
+        registry
+            .reserve("b", "X.TXT", Path::new("b/X.TXT"))
+            .unwrap();
+    }
 }
