@@ -21,7 +21,26 @@
 set -eu
 cd "$(dirname "$0")" || exit 1
 W=$(cygpath -w "$PWD" | tr '\\' '/')
-QEMU="${QEMU:-/c/Program Files/qemu/qemu-system-x86_64.exe}"
+# QEMU discovery: honour an explicit QEMU= override, then probe PATH and the
+# common install roots (Program Files, MSYS2 mingw64/ucrt64) — no hardcoded
+# single location.
+QEMU="${QEMU:-}"
+if [ -z "$QEMU" ] || [ ! -x "$QEMU" ]; then
+  QEMU=""
+  for cand in \
+    "/c/Program Files/qemu/qemu-system-x86_64.exe" \
+    "/c/msys64/mingw64/bin/qemu-system-x86_64.exe" \
+    "/c/msys64/ucrt64/bin/qemu-system-x86_64.exe" \
+    "$(command -v qemu-system-x86_64 2>/dev/null || true)"
+  do
+    if [ -n "$cand" ] && [ -x "$cand" ]; then QEMU="$cand"; break; fi
+  done
+fi
+[ -n "$QEMU" ] && [ -x "$QEMU" ] || {
+  echo "qemu-system-x86_64 not found (install it or set QEMU=/path/to/qemu-system-x86_64.exe)"
+  exit 2
+}
+echo "qemu: $QEMU"
 ASSETS="${ASSETS:-$W/assets}"
 FS2ISO="${FS2ISO:-$W/../../target/release/fs2iso.exe}"
 ISO="${ISO:-}"
