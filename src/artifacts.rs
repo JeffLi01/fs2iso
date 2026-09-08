@@ -123,7 +123,12 @@ fn hide_artifacts_in_tree(
     let mut record_offset = 0usize;
     while record_offset + RECORD_IDENTIFIER_OFFSET < root_data_length {
         let record_length = directory_data[record_offset + RECORD_LENGTH_OFFSET] as usize;
-        if record_length == 0 || record_offset + record_length > root_data_length {
+        // A valid ECMA-119 9.1 record is at least 34 bytes (33-byte header +
+        // 1-byte identifier). Anything shorter or past the extent end means
+        // the tail is padding/foreign — stop rather than index out of bounds.
+        if record_length < RECORD_IDENTIFIER_OFFSET + 1
+            || record_offset + record_length > root_data_length
+        {
             break;
         }
         let record = &directory_data[record_offset..record_offset + record_length];

@@ -592,6 +592,44 @@ fn engine_artifact_names_are_reserved_on_bootable_discs() {
     build_iso(&data, std::slice::from_ref(&fixture.pkg), &opts).unwrap();
 }
 
+/// ISO9660 BASE namespace content parity: the engine may rewrite base names
+/// (uppercase folding, non-d-characters to '_', dedup suffixes) but the
+/// file CONTENTS must match the payload exactly, file for file. Only the
+/// Joliet tree was content-verified before; the base tree is what
+/// ISO9660-only readers (older firmware, some mount stacks) actually see.
+#[test]
+fn base_tree_contents_match_payload() {
+    let fixture = Fixture::new();
+    let payload = sorted_payload(&fixture);
+    let out = fixture.dir.join("out.iso");
+    let opts = Options {
+        flat: true,
+        no_eltorito: true,
+        ..Options::default()
+    };
+    build_iso(&out, std::slice::from_ref(&fixture.pkg), &opts).unwrap();
+
+    let image = parse_image(&out);
+    let base = walk(&image.img, image.primary_lba * SECTOR_BYTES, false);
+    let mut base_contents: Vec<Vec<u8>> = base
+        .iter()
+        .filter(|(_, (is_directory, _, _))| !*is_directory)
+        .map(|(_, (_, size, extent))| content(&image.img, *extent, *size))
+        .collect();
+    let mut payload_contents: Vec<Vec<u8>> = payload.iter().map(|(_, data)| data.clone()).collect();
+    base_contents.sort();
+    payload_contents.sort();
+    assert_eq!(
+        base_contents.len(),
+        payload_contents.len(),
+        "base tree file count"
+    );
+    assert_eq!(
+        base_contents, payload_contents,
+        "base tree contents must equal payload contents (names are engine-normalized)"
+    );
+}
+
 /// Label cleaning and summary sanity.
 #[test]
 fn label_and_summary() {
