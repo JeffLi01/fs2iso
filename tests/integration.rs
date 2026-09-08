@@ -126,9 +126,7 @@ fn decode_identifier(identifier: &[u8], joliet: bool) -> Option<String> {
         return Some(String::from_utf8_lossy(name).into_owned());
     }
     let units: Vec<u16> = identifier
-        .as_chunks::<2>()
-        .0
-        .iter()
+        .chunks_exact(2)
         .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
         .collect();
     Some(String::from_utf16_lossy(&units))

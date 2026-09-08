@@ -81,9 +81,7 @@ fn record_name(record: &[u8], joliet: bool) -> String {
         &record[RECORD_IDENTIFIER_OFFSET..RECORD_IDENTIFIER_OFFSET + identifier_length];
     if joliet {
         let units: Vec<u16> = identifier
-            .as_chunks::<2>()
-            .0
-            .iter()
+            .chunks_exact(2)
             .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
             .collect();
         String::from_utf16_lossy(&units)

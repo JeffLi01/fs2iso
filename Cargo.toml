@@ -2,8 +2,10 @@
 name = "fs2iso"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.80"
 description = "Pure-Rust packer: pack files/directories into an ISO9660 (+Joliet, El Torito EFI boot via FAT container) image, for BMC virtual media / UEFI shell (fs0) use"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/JeffLi01/fs2iso"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -13,5 +15,9 @@ hadris-iso = { version = "2.3", features = ["joliet"] }
 
 [dev-dependencies]
 assert_cmd = "2"
-fatfs = "0.3"
 predicates = "3"
+
+# Single-exe deliverable: strip debug info and thin-LTO the release build.
+[profile.release]
+strip = true
+lto = "thin"

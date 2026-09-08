@@ -40,23 +40,48 @@ fs2iso --no-eltorito data.iso files/  # 只要纯 ISO9660 数据盘（无 esp.im
 
 选项：`-l/--label`、`--flat`、`--no-eltorito`、`-q/--quiet`。
 退出码：0 成功；1 运行错误；2 CLI 用法错误。
-防护：拒绝覆盖输入文件、同名大小写折叠冲突检测、junction/链接环检测、
-保留根级 `esp.img` 名（工具工件）防冲突。
+防护：拒绝覆盖输入文件、**全树**同名大小写折叠冲突检测（文件与目录、
+根级与嵌套合并；错误信息带双方来源路径）、junction/链接环检测、
+保留根级 `esp.img` 与 `boot.catalog`（工具工件）防冲突、FAT 无法表达
+的名字（`" * : < > ? \ |` 及控制字符、尾点/尾空格等）在写入前报错。
+
+## 语义与限制（请先读）
+
+- **同名折叠冲突**：ISO9660 与 FAT 的名字都不区分大小写。同一镜像目录
+  里 `A.TXT` 与 `a.txt` 之类折叠后相同的名字（Linux/大小写敏感源、
+  多个 `--flat` 输入合并）会被拒绝——底层引擎对这类冲突是静默合并，
+  会丢文件。
+- **符号链接与 junction**：收集时跟随链接（打包的是链接指向的内容），
+  目录环（junction 回环）报错；指向镜像外目录的链接会把整个目标树拉
+  入镜像，打包前请注意。
+- **输出覆盖**：输出文件若已存在会被直接覆盖；仅当输出路径恰好是某个
+  payload 输入文件时才拒绝（防止把自己写没）。
+- **esp.img 只含文件**：FAT 容器里每个文件都原样存在，但**空目录不在
+  esp.img 中**（FAT 目录由文件驱动创建）；空目录保留在 ISO9660 数据
+  树里。
+- **内存**：构建时 payload 会整份读入内存（esp.img 需整体成形后再嵌入
+  光盘），峰值约 2–3 倍 payload；FAT 容器硬上限 4 GiB（FAT32）。
+- **UDF 未启用**：hadris-cd 的 UDF 层不完整（缺 ECMA-167 文件集终止描
+  述符），历史 UDF-bridge 变体见 git `9f17b72`。
 
 ## 构建与测试
 
 ```bash
 cargo build --release          # target/release/fs2iso.exe
-cargo test                     # 单元 + 5 集成：esp.img 无条件生成、fatfs 读回
-                               # 逐路径比对(无注入文件)、Joliet 数据树原名/内容、
-                               # --no-eltorito 纯数据盘、错误路径、label
+cargo test                     # 单元 9 + 集成 8 + CLI 6：esp.img 无条件生成、
+                               # fatfs 读回逐路径比对(无注入文件)、base/Joliet
+                               # 数据树内容逐文件比对、--no-eltorito 纯数据盘、
+                               # 保留名/折叠冲突/错误路径、label、退出码 0/1/2
 py -3 scripts/verify_pycdlib.py out.iso payload --flat   # 开发期交叉验证（非交付物）
 bash tests/efi/run_acceptance.sh   # QEMU+OVMF 真固件：从盘引导 → esp 卷(fs0) 里
                                    # payload 文件可读 → mm 自退出码 1
 ```
 
-验收资产（OVMF 固件，内含 EFI Internal Shell，无需外部 shell）由
+QEMU 自动发现（PATH、MSYS2 mingw64/ucrt64、Program Files），可用
+`QEMU=` 覆盖；OVMF 固件（内含 EFI Internal Shell，无需外部 shell）由
 `tests/efi/fetch_assets.sh` 从 Debian 软件包池获取（无需 github.com）。
+CI（GitHub Actions）在 ubuntu/windows 上跑 fmt + clippy(-D warnings) +
+test + release 构建。
 
 ## 说明
 
@@ -67,8 +92,6 @@ bash tests/efi/run_acceptance.sh   # QEMU+OVMF 真固件：从盘引导 → esp 
   ISO9660 数据盘，而 FAT 是 UEFI 通用文件系统；esp.img 让这类固件也能在
   shell 中看到文件（QEMU+OVMF 实测：引导后 fs0 列出并读取全部 payload）。
 - `--no-eltorito` 产物 = 与 genisoimage 等价的标准数据盘（无 esp.img）。
-- UDF 未启用：hadris-cd 的 UDF 层不完整（缺 ECMA-167 文件集终止描述符），
-  历史 UDF-bridge 变体见 git `9f17b72`。
 
 ## 架构
 
