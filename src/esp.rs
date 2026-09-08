@@ -17,7 +17,7 @@ use std::io::{Cursor, Write};
 
 const SECTOR_SIZE: u64 = 512;
 /// Smallest image we format.
-const MINIMUM_IMAGE_BYTES: u64 = 1 * 1024 * 1024;
+const MINIMUM_IMAGE_BYTES: u64 = 1024 * 1024;
 /// Fixed slack for FAT tables / root dir / formatting overhead.
 const FORMATTING_SLACK_BYTES: u64 = 512 * 1024;
 /// FAT32 kicks in above this size.
@@ -29,12 +29,15 @@ const MAXIMUM_IMAGE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// it, creating intermediate directories as needed. Returns the raw FAT
 /// image bytes, ready to be stored as `esp.img` on the disc.
 pub fn build_esp(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
-    let payload_total: u64 = entries.iter().map(|(_, content)| content.len() as u64).sum();
+    let payload_total: u64 = entries
+        .iter()
+        .map(|(_, content)| content.len() as u64)
+        .sum();
     if payload_total == 0 {
         return Err("nothing to pack into the FAT container".to_string());
     }
-    let mut image_bytes = ((payload_total + FORMATTING_SLACK_BYTES).div_ceil(SECTOR_SIZE))
-        * SECTOR_SIZE;
+    let mut image_bytes =
+        ((payload_total + FORMATTING_SLACK_BYTES).div_ceil(SECTOR_SIZE)) * SECTOR_SIZE;
     if image_bytes < MINIMUM_IMAGE_BYTES {
         image_bytes = MINIMUM_IMAGE_BYTES;
     }
@@ -68,12 +71,12 @@ pub fn build_esp(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
             for component in path_components {
                 directory = match directory.open_dir(component) {
                     Ok(existing) => existing,
-                    Err(_) => directory
-                        .create_dir(component)
-                        .map_err(|e| e.to_string())?,
+                    Err(_) => directory.create_dir(component).map_err(|e| e.to_string())?,
                 };
             }
-            let mut file = directory.create_file(leaf_name).map_err(|e| e.to_string())?;
+            let mut file = directory
+                .create_file(leaf_name)
+                .map_err(|e| e.to_string())?;
             file.write_all(content).map_err(|e| e.to_string())?;
             file.flush().map_err(|e| e.to_string())?;
         }

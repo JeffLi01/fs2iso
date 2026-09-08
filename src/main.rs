@@ -25,7 +25,8 @@ use std::path::PathBuf;
     name = "fs2iso",
     version,
     about = "Pack files/directories into an ISO 9660 image (BMC virtual media / UEFI shell)",
-    after_help = "EXAMPLES:\n    fs2iso tools.iso D:\\fw\\efi_tools    # files also inside esp.img (FAT)\n    fs2iso --flat fix.iso FixPkg/         # contents at root, mirrored into esp.img\n    fs2iso --no-eltorito data.iso files/  # plain ISO9660 data disc, no esp.img\n")]
+    after_help = "EXAMPLES:\n    fs2iso tools.iso D:\\fw\\efi_tools    # files also inside esp.img (FAT)\n    fs2iso --flat fix.iso FixPkg/         # contents at root, mirrored into esp.img\n    fs2iso --no-eltorito data.iso files/  # plain ISO9660 data disc, no esp.img\n"
+)]
 struct Cli {
     /// Volume label (default: derived from the output file name)
     #[arg(short = 'l', long, value_name = "NAME")]

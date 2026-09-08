@@ -77,10 +77,13 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
 /// ASCII with an optional ";<version>" suffix (ECMA-119 9.1.6).
 fn record_name(record: &[u8], joliet: bool) -> String {
     let identifier_length = record[RECORD_IDENTIFIER_LENGTH_OFFSET] as usize;
-    let identifier = &record[RECORD_IDENTIFIER_OFFSET..RECORD_IDENTIFIER_OFFSET + identifier_length];
+    let identifier =
+        &record[RECORD_IDENTIFIER_OFFSET..RECORD_IDENTIFIER_OFFSET + identifier_length];
     if joliet {
         let units: Vec<u16> = identifier
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
             .collect();
         String::from_utf16_lossy(&units)
@@ -118,7 +121,7 @@ fn hide_artifacts_in_tree(
 
     let mut patched = 0usize;
     let mut record_offset = 0usize;
-    while record_offset + RECORD_IDENTIFIER_OFFSET + 1 <= root_data_length {
+    while record_offset + RECORD_IDENTIFIER_OFFSET < root_data_length {
         let record_length = directory_data[record_offset + RECORD_LENGTH_OFFSET] as usize;
         if record_length == 0 || record_offset + record_length > root_data_length {
             break;
@@ -137,12 +140,14 @@ fn hide_artifacts_in_tree(
             }
         });
         if is_artifact {
-            let flags_offset = root_extent as u64 * SECTOR_SIZE + record_offset as u64
+            let flags_offset = root_extent as u64 * SECTOR_SIZE
+                + record_offset as u64
                 + RECORD_FLAGS_OFFSET as u64;
             file.seek(SeekFrom::Start(flags_offset))
                 .map_err(|e| e.to_string())?;
             let mut flags_byte = [0u8; 1];
-            file.read_exact(&mut flags_byte).map_err(|e| e.to_string())?;
+            file.read_exact(&mut flags_byte)
+                .map_err(|e| e.to_string())?;
             flags_byte[0] |= FLAG_HIDDEN;
             file.seek(SeekFrom::Start(flags_offset))
                 .map_err(|e| e.to_string())?;
@@ -179,11 +184,10 @@ pub(crate) fn hide_engine_artifacts(path: &Path) -> Result<(), String> {
             DESCRIPTOR_TYPE_PRIMARY => primary_lba = Some(logical_block),
             DESCRIPTOR_TYPE_SUPPLEMENTARY
                 if sector[JOLIET_ESCAPE_OFFSET..JOLIET_ESCAPE_OFFSET + 3]
-                    == JOLIET_ESCAPE_SEQUENCE =>
+                    == JOLIET_ESCAPE_SEQUENCE
+                    && joliet_lba.is_none() =>
             {
-                if joliet_lba.is_none() {
-                    joliet_lba = Some(logical_block);
-                }
+                joliet_lba = Some(logical_block);
             }
             _ => {}
         }

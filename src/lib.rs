@@ -25,11 +25,10 @@ mod esp;
 
 use std::path::{Path, PathBuf};
 
-use collect::{
-    canonical_existing, canonical_maybe_missing, collect_payload, CollectedPayload,
-};
+use collect::{canonical_existing, canonical_maybe_missing, collect_payload, CollectedPayload};
 use hadris_cd::OpticalImageOptions;
 
+#[derive(Default)]
 pub struct Options {
     /// Volume label (cleaned). None -> derived from the output file name.
     pub label: Option<String>,
@@ -38,16 +37,6 @@ pub struct Options {
     /// Do not pack the FAT container / add an El Torito entry — produce a
     /// plain ISO9660+Joliet data disc.
     pub no_eltorito: bool,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Options {
-            label: None,
-            flat: false,
-            no_eltorito: false,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -116,9 +105,17 @@ pub fn build_iso(
         },
     };
 
-    let mut image_options = OpticalImageOptions::default();
-    image_options.volume_id = label.clone();
-    image_options.udf.enabled = false;
+    // UDF is disabled on purpose: hadris-cd's UDF layer is not
+    // spec-complete (missing ECMA-167 file-set terminator), and Windows
+    // udfs.sys refuses such volumes outright.
+    let mut image_options = OpticalImageOptions {
+        volume_id: label.clone(),
+        udf: hadris_cd::UdfOptions {
+            enabled: false,
+            ..Default::default()
+        },
+        ..OpticalImageOptions::default()
+    };
 
     // === FAT container (esp.img) holds EVERY payload file ===
     // The user's files/directories are packed into a FAT image (esp.img)

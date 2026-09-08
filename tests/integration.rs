@@ -126,7 +126,9 @@ fn decode_identifier(identifier: &[u8], joliet: bool) -> Option<String> {
         return Some(String::from_utf8_lossy(name).into_owned());
     }
     let units: Vec<u16> = identifier
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
         .collect();
     Some(String::from_utf16_lossy(&units))
@@ -157,10 +159,23 @@ fn walk(img: &[u8], desc_off: usize, joliet: bool) -> HashMap<String, (bool, u64
                 format!("{}/{}", prefix, name)
             };
             if record.is_directory {
-                out.insert(relative_path.clone(), (true, record.data_length as u64, record.extent));
-                visit(img, joliet, record.extent, record.data_length, &relative_path, out);
+                out.insert(
+                    relative_path.clone(),
+                    (true, record.data_length as u64, record.extent),
+                );
+                visit(
+                    img,
+                    joliet,
+                    record.extent,
+                    record.data_length,
+                    &relative_path,
+                    out,
+                );
             } else {
-                out.insert(relative_path, (false, record.data_length as u64, record.extent));
+                out.insert(
+                    relative_path,
+                    (false, record.data_length as u64, record.extent),
+                );
             }
         }
     }
@@ -259,7 +274,6 @@ fn list_fat_files(fat_bytes: Vec<u8>) -> Vec<String> {
     files
 }
 
-
 /// File flags (bit0 = hidden) of the record named `target` at the ROOT of
 /// the namespace whose descriptor sits at byte offset `descriptor_offset`
 /// (ECMA-119 8.4: the root directory record starts at descriptor offset 156).
@@ -274,9 +288,7 @@ fn root_record_flags(
     let root_length = read_u32_le(descriptor, 156 + 10);
     let root_records = directory_records(&image.img, root_lba, root_length);
     root_records.iter().find_map(|record| {
-        let Some(name) = decode_identifier(&record.identifier, joliet) else {
-            return None;
-        };
+        let name = decode_identifier(&record.identifier, joliet)?;
         let matches = if joliet {
             name == target
         } else {
@@ -322,7 +334,12 @@ fn default_keep_parent_packs_esp() {
     let payload = sorted_payload(&fixture);
     fixture.file("EFI/BOOT/BOOTX64.EFI", b"a user-provided efi\n"); // treated as plain data
     let out = fixture.dir.join("out.iso");
-    let sum = build_iso(&out, &[fixture.pkg.clone()], &Options::default()).unwrap();
+    let sum = build_iso(
+        &out,
+        std::slice::from_ref(&fixture.pkg),
+        &Options::default(),
+    )
+    .unwrap();
     assert!(sum.bootable);
     assert_eq!(sum.files, payload.len() as u64 + 1);
 
@@ -344,7 +361,12 @@ fn default_keep_parent_packs_esp() {
             .copied()
             .unwrap_or_else(|| panic!("missing in joliet: {}", relative_path));
         assert_eq!(size, data.len() as u64, "size of {}", relative_path);
-        assert_eq!(&content(&image.img, ext, size), data, "content of {}", relative_path);
+        assert_eq!(
+            &content(&image.img, ext, size),
+            data,
+            "content of {}",
+            relative_path
+        );
     }
     let jfiles: Vec<String> = joliet_tree
         .iter()
@@ -355,9 +377,15 @@ fn default_keep_parent_packs_esp() {
     assert_eq!(jfiles.len(), expected.len(), "{:?}", jfiles);
 
     // El Torito points at esp.img
-    let (_, esp_size, esp_ext) = joliet_tree.get("esp.img").copied().expect("esp.img present");
+    let (_, esp_size, esp_ext) = joliet_tree
+        .get("esp.img")
+        .copied()
+        .expect("esp.img present");
     assert!(esp_size > 0);
-    assert_eq!(&content(&image.img, esp_ext, esp_size)[510..512], &[0x55, 0xAA]);
+    assert_eq!(
+        &content(&image.img, esp_ext, esp_size)[510..512],
+        &[0x55, 0xAA]
+    );
     assert!(
         boot_entries(&image)
             .iter()
@@ -368,11 +396,17 @@ fn default_keep_parent_packs_esp() {
     // Engine artifacts are HIDDEN in both namespaces (bit0 of file flags);
     // the user's own files are not.
     for artifact in ["esp.img", "boot.catalog"] {
-        let base_flags = root_record_flags(&image, image.primary_lba * SECTOR_BYTES, artifact, false)
-            .expect("artifact in base tree");
+        let base_flags =
+            root_record_flags(&image, image.primary_lba * SECTOR_BYTES, artifact, false)
+                .expect("artifact in base tree");
         assert_eq!(base_flags & 1, 1, "{} hidden in base tree", artifact);
-        let jol_flags = root_record_flags(&image, joliet_lba(&image).unwrap() * SECTOR_BYTES, artifact, true)
-            .expect("artifact in joliet tree");
+        let jol_flags = root_record_flags(
+            &image,
+            joliet_lba(&image).unwrap() * SECTOR_BYTES,
+            artifact,
+            true,
+        )
+        .expect("artifact in joliet tree");
         assert_eq!(jol_flags & 1, 1, "{} hidden in joliet tree", artifact);
     }
 
@@ -380,12 +414,15 @@ fn default_keep_parent_packs_esp() {
     let esp_bytes = content(&image.img, esp_ext, esp_size);
     let mut actual = list_fat_files(esp_bytes);
     let mut want: Vec<String> = expected
-            .iter()
-            .map(|(relative_path, _)| relative_path.to_uppercase())
-            .collect();
+        .iter()
+        .map(|(relative_path, _)| relative_path.to_uppercase())
+        .collect();
     want.sort();
     actual.sort();
-    assert_eq!(actual, want, "esp.img mirrors payload exactly (no injected files)");
+    assert_eq!(
+        actual, want,
+        "esp.img mirrors payload exactly (no injected files)"
+    );
     assert_eq!(sum.label, "OUT");
 }
 
@@ -399,18 +436,21 @@ fn flat_packs_esp_at_root() {
         flat: true,
         ..Options::default()
     };
-    let sum = build_iso(&out, &[fixture.pkg.clone()], &opts).unwrap();
+    let sum = build_iso(&out, std::slice::from_ref(&fixture.pkg), &opts).unwrap();
     assert!(sum.bootable);
 
     let image = parse_image(&out);
     let joliet_tree = walk(&image.img, joliet_lba(&image).unwrap() * SECTOR_BYTES, true);
-    let (_, esp_size, esp_ext) = joliet_tree.get("esp.img").copied().expect("esp.img present");
+    let (_, esp_size, esp_ext) = joliet_tree
+        .get("esp.img")
+        .copied()
+        .expect("esp.img present");
     let esp_bytes = content(&image.img, esp_ext, esp_size);
     let mut actual = list_fat_files(esp_bytes);
     let mut want: Vec<String> = payload
-            .iter()
-            .map(|(relative_path, _)| relative_path.to_uppercase())
-            .collect();
+        .iter()
+        .map(|(relative_path, _)| relative_path.to_uppercase())
+        .collect();
     want.sort();
     actual.sort();
     assert_eq!(actual, want, "flat esp.img mirrors payload at root");
@@ -427,11 +467,14 @@ fn no_eltorito_is_plain_data_disc() {
         no_eltorito: true,
         ..Options::default()
     };
-    let sum = build_iso(&out, &[fixture.pkg.clone()], &opts).unwrap();
+    let sum = build_iso(&out, std::slice::from_ref(&fixture.pkg), &opts).unwrap();
     assert!(!sum.bootable);
     let image = parse_image(&out);
     let joliet_tree = walk(&image.img, joliet_lba(&image).unwrap() * SECTOR_BYTES, true);
-    assert!(!joliet_tree.contains_key("esp.img"), "no esp.img on --no-eltorito");
+    assert!(
+        !joliet_tree.contains_key("esp.img"),
+        "no esp.img on --no-eltorito"
+    );
     assert!(boot_entries(&image).is_empty());
     let files: Vec<String> = joliet_tree
         .iter()
@@ -464,7 +507,7 @@ fn error_paths() {
 
     let err = build_iso(
         &fixture.pkg.join("readme.txt"),
-        &[fixture.pkg.clone()],
+        std::slice::from_ref(&fixture.pkg),
         &Options::default(),
     )
     .unwrap_err();
@@ -499,9 +542,8 @@ fn label_and_summary() {
         flat: true,
         label: Some("My Tools 2024!".to_string()),
         no_eltorito: true,
-        ..Options::default()
     };
-    let sum = build_iso(&out, &[fixture.pkg.clone()], &opts).unwrap();
+    let sum = build_iso(&out, std::slice::from_ref(&fixture.pkg), &opts).unwrap();
     assert_eq!(sum.label, "MY_TOOLS_2024_");
     assert_eq!(sum.files, 9);
     assert!(sum.dirs >= 4, "dirs counted: {}", sum.dirs);

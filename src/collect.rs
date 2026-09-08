@@ -56,9 +56,9 @@ pub(crate) fn canonical_maybe_missing(path: &Path) -> Result<PathBuf, String> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let file_name =
-        path.file_name()
-            .ok_or_else(|| format!("bad path {:?}", path))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("bad path {:?}", path))?;
     Ok(canonical_existing(parent)?.join(file_name))
 }
 
@@ -141,10 +141,7 @@ fn add_directory_contents(
 
 /// Collect `inputs` into a tree + manifest. `flat` selects the merge-into-
 /// root behaviour for directory inputs.
-pub(crate) fn collect_payload(
-    inputs: &[PathBuf],
-    flat: bool,
-) -> Result<CollectedPayload, String> {
+pub(crate) fn collect_payload(inputs: &[PathBuf], flat: bool) -> Result<CollectedPayload, String> {
     let mut root = Directory::root();
     let mut records = Vec::new();
     let mut directory_count = 0u64;
