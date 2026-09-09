@@ -509,7 +509,7 @@ fn error_paths() {
         &Options::default(),
     )
     .unwrap_err();
-    assert!(err.contains("would overwrite"), "{}", err);
+    assert!(err.to_string().contains("would overwrite"), "{}", err);
 
     let a = fixture.pkg.join("a");
     let b = fixture.pkg.join("b");
@@ -527,7 +527,7 @@ fn error_paths() {
         },
     )
     .unwrap_err();
-    assert!(err.contains("duplicate root name"), "{}", err);
+    assert!(err.to_string().contains("duplicate root name"), "{}", err);
 }
 
 /// Same-named subdirectory arriving from two different --flat inputs: both
@@ -556,8 +556,8 @@ fn case_fold_collision_inside_merged_dir_rejected() {
         },
     )
     .unwrap_err();
-    assert!(err.contains("duplicate"), "{}", err);
-    assert!(err.contains("sub"), "{}", err);
+    assert!(err.to_string().contains("duplicate"), "{}", err);
+    assert!(err.to_string().contains("sub"), "{}", err);
 }
 
 /// Engine artifact names (esp.img, boot.catalog) are reserved at the image
@@ -578,7 +578,7 @@ fn engine_artifact_names_are_reserved_on_bootable_discs() {
         ..Options::default()
     };
     let err = build_iso(&out, std::slice::from_ref(&fixture.pkg), &opts).unwrap_err();
-    assert!(err.contains("reserved"), "{}", err);
+    assert!(err.to_string().contains("reserved"), "{}", err);
 
     // plain data disc: no engine artifacts, user names are fine
     let data = fixture.dir.join("data.iso");

@@ -24,6 +24,7 @@ mod collect;
 mod esp;
 
 use std::path::{Path, PathBuf};
+use std::fmt;
 
 use collect::{canonical_existing, canonical_maybe_missing, collect_payload, CollectedPayload};
 use hadris_cd::OpticalImageOptions;
@@ -50,6 +51,47 @@ pub struct BuildSummary {
     /// Torito boot entry.
     pub bootable: bool,
 }
+
+#[derive(Debug)]
+pub enum BuildError {
+    NoInputs,
+    Collection(String),
+    OutputPath(String),
+    OutputConflict(PathBuf),
+    ReservedArtifact(String),
+    PayloadRead { path: PathBuf, message: String },
+    ImageBuild(String),
+    OutputCreate { path: PathBuf, message: String },
+    ArtifactPatch(String),
+}
+
+impl fmt::Display for BuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoInputs => write!(formatter, "no input paths given"),
+            Self::Collection(message) | Self::OutputPath(message) => write!(formatter, "{}", message),
+            Self::OutputConflict(path) => {
+                write!(formatter, "output image {:?} would overwrite a payload file", path)
+            }
+            Self::ReservedArtifact(name) => write!(
+                formatter,
+                "payload contains a root-level file named '{}', which is reserved for an engine artifact ({}); rename it",
+                name,
+                RESERVED_ARTIFACT_NAMES.join(" / ")
+            ),
+            Self::PayloadRead { path, message } => {
+                write!(formatter, "cannot read {:?}: {}", path, message)
+            }
+            Self::ImageBuild(message) => write!(formatter, "image build failed: {}", message),
+            Self::OutputCreate { path, message } => {
+                write!(formatter, "cannot create {:?}: {}", path, message)
+            }
+            Self::ArtifactPatch(message) => write!(formatter, "{}", message),
+        }
+    }
+}
+
+impl std::error::Error for BuildError {}
 
 const RESERVED_ARTIFACT_NAMES: [&str; 2] = ["esp.img", "boot.catalog"];
 
@@ -80,19 +122,14 @@ fn resolve_label(output: &Path, requested: Option<&str>) -> String {
         .unwrap_or_else(|| "FS2ISO".to_string())
 }
 
-fn validate_artifact_names(collected_payload: &CollectedPayload) -> Result<(), String> {
+fn validate_artifact_names(collected_payload: &CollectedPayload) -> Result<(), BuildError> {
     let clash = collected_payload.records.iter().find(|record| {
         RESERVED_ARTIFACT_NAMES
             .iter()
             .any(|reserved| record.relative_path.eq_ignore_ascii_case(reserved))
     });
     if let Some(clash) = clash {
-        return Err(format!(
-            "payload contains a root-level file named '{}', which is reserved for an \
-             engine artifact ({}); rename it",
-            clash.relative_path,
-            RESERVED_ARTIFACT_NAMES.join(" / ")
-        ));
+        return Err(BuildError::ReservedArtifact(clash.relative_path.clone()));
     }
     Ok(())
 }
@@ -111,21 +148,21 @@ pub fn build_iso(
     output: &Path,
     inputs: &[PathBuf],
     options: &Options,
-) -> Result<BuildSummary, String> {
+) -> Result<BuildSummary, BuildError> {
     if inputs.is_empty() {
-        return Err("no input paths given".to_string());
+        return Err(BuildError::NoInputs);
     }
 
-    let mut collected_payload = collect_payload(inputs, options.flat)?;
+    let mut collected_payload =
+        collect_payload(inputs, options.flat).map_err(BuildError::Collection)?;
 
     // Refuse to clobber a payload file with the output image.
-    let output_canonical = canonical_maybe_missing(output)?;
+    let output_canonical = canonical_maybe_missing(output).map_err(BuildError::OutputPath)?;
     for record in &collected_payload.records {
-        if canonical_existing(&record.source_path)? == output_canonical {
-            return Err(format!(
-                "output image {:?} would overwrite a payload file",
-                output
-            ));
+        if canonical_existing(&record.source_path).map_err(BuildError::Collection)?
+            == output_canonical
+        {
+            return Err(BuildError::OutputConflict(output.to_path_buf()));
         }
     }
 
@@ -176,14 +213,17 @@ pub fn build_iso(
         .create(true)
         .truncate(true)
         .open(output)
-        .map_err(|e| format!("cannot create {:?}: {}", output, e))?;
+        .map_err(|error| BuildError::OutputCreate {
+            path: output.to_path_buf(),
+            message: error.to_string(),
+        })?;
     hadris_cd::OpticalImageWriter::create(output_file, collected_payload.tree, image_options)
-        .map_err(|e| format!("image build failed: {}", e))?;
+        .map_err(|error| BuildError::ImageBuild(error.to_string()))?;
 
     // Engine artifacts (esp.img, boot.catalog) must not clutter the data
     // tree the user sees: mark them hidden in both namespaces.
     if bootable {
-        artifacts::hide_engine_artifacts(output)?;
+        artifacts::hide_engine_artifacts(output).map_err(BuildError::ArtifactPatch)?;
     }
 
     let sectors = sectors_for(output);
@@ -200,14 +240,17 @@ pub fn build_iso(
 
 /// Read every payload file into memory and build the FAT container (esp.img)
 /// that mirrors the image's file layout.
-fn build_esp_container(collected_payload: &mut CollectedPayload) -> Result<Vec<u8>, String> {
+fn build_esp_container(collected_payload: &mut CollectedPayload) -> Result<Vec<u8>, BuildError> {
     let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(collected_payload.records.len());
     for record in &collected_payload.records {
         let bytes = std::fs::read(&record.source_path)
-            .map_err(|e| format!("cannot read {:?}: {}", record.source_path, e))?;
+            .map_err(|error| BuildError::PayloadRead {
+                path: record.source_path.clone(),
+                message: error.to_string(),
+            })?;
         entries.push((record.relative_path.clone(), bytes));
     }
-    esp::build_esp(&entries)
+    esp::build_esp(&entries).map_err(BuildError::ImageBuild)
 }
 
 /// Point the disc's El Torito boot record at the esp.img FAT container.
@@ -289,8 +332,8 @@ mod tests {
             payload_bytes: 0,
         };
         let error = validate_artifact_names(&payload).unwrap_err();
-        assert!(error.contains("reserved"));
-        assert!(error.contains("ESP.IMG"));
+        assert!(matches!(error, super::BuildError::ReservedArtifact(ref name) if name == "ESP.IMG"));
+        assert!(error.to_string().contains("reserved"));
     }
 
     #[test]
