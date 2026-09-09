@@ -19,8 +19,18 @@
 # Usage: bash tests/efi/run_acceptance.sh
 # Env overrides: QEMU, ASSETS, FS2ISO, ISO, WATCHDOG (default 90)
 set -eu
-cd "$(dirname "$0")" || exit 1
-W=$(cygpath -w "$PWD" | tr '\\' '/')
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+cd "$SCRIPT_DIR" || exit 1
+case "$(uname -s 2>/dev/null || printf 'unknown')" in
+  MINGW*|MSYS*|CYGWIN*)
+    W=$(cygpath -w "$SCRIPT_DIR" | tr '\\' '/')
+    FS2ISO_NAME="fs2iso.exe"
+    ;;
+  *)
+    W="$SCRIPT_DIR"
+    FS2ISO_NAME="fs2iso"
+    ;;
+esac
 # QEMU discovery: honour an explicit QEMU= override, then probe PATH and the
 # common install roots (Program Files, MSYS2 mingw64/ucrt64) — no hardcoded
 # single location.
@@ -42,7 +52,7 @@ fi
 }
 echo "qemu: $QEMU"
 ASSETS="${ASSETS:-$W/assets}"
-FS2ISO="${FS2ISO:-$W/../../target/release/fs2iso.exe}"
+FS2ISO="${FS2ISO:-$W/../../target/release/$FS2ISO_NAME}"
 ISO="${ISO:-}"
 WATCHDOG="${WATCHDOG:-90}"
 

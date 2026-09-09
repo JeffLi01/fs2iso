@@ -4,7 +4,8 @@
 # built-in "EFI Internal Shell" in its Boot Manager.
 # Output: tests/efi/assets/{OVMF_CODE_4M.fd, OVMF_VARS_4M.fd}
 set -eu
-cd "$(dirname "$0")" || exit 1
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+cd "$SCRIPT_DIR" || exit 1
 OUT=assets
 rm -rf "$OUT"; mkdir -p "$OUT" x
 POOL="https://deb.debian.org/debian/pool/main/e/edk2"
@@ -15,7 +16,18 @@ echo "ovmf: $GEN"
 curl -sSL -m 300 -o ovmf.deb "$POOL/$GEN"
 
 # extract .ar -> data.tar.xz -> files (python: ar + tarfile/lzma)
-py -3 - <<'PYEOF'
+if command -v python3 >/dev/null 2>&1; then
+    PYTHON=(python3)
+elif command -v python >/dev/null 2>&1; then
+    PYTHON=(python)
+elif command -v py >/dev/null 2>&1; then
+    PYTHON=(py -3)
+else
+    echo "Python 3 not found (install python3/python or set up the Windows py launcher)"
+    exit 2
+fi
+
+"${PYTHON[@]}" - <<'PYEOF'
 import io, os, tarfile, sys
 
 def members(deb):
