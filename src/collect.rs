@@ -18,6 +18,7 @@ pub(crate) struct FileRecord {
     /// Image-relative path, forward slashes ("" prefix => image root).
     pub(crate) relative_path: String,
     pub(crate) source_path: PathBuf,
+    pub(crate) content: Vec<u8>,
 }
 
 pub(crate) struct CollectedPayload {
@@ -171,12 +172,15 @@ fn add_directory_contents(
             )?;
             target_directory.add_subdir(subdirectory);
         } else {
-            *payload_bytes += metadata.len();
+            let content = std::fs::read(&full_path)
+                .map_err(|e| format!("cannot read {:?}: {}", full_path, e))?;
+            *payload_bytes += content.len() as u64;
             records.push(FileRecord {
                 relative_path: relative_path.clone(),
                 source_path: full_path.clone(),
+                content: content.clone(),
             });
-            target_directory.add_file(FileEntry::from_path(entry_name, full_path));
+            target_directory.add_file(FileEntry::from_buffer(entry_name, content));
         }
     }
     visited.remove(&canonical_path);
@@ -199,12 +203,15 @@ pub(crate) fn collect_payload(inputs: &[PathBuf], flat: bool) -> Result<Collecte
         if !metadata.is_dir() {
             let name = input_name(input)?;
             registry.reserve("", &name, input)?;
-            payload_bytes += metadata.len();
+            let content = std::fs::read(input)
+                .map_err(|e| format!("cannot read {:?}: {}", input, e))?;
+            payload_bytes += content.len() as u64;
             records.push(FileRecord {
                 relative_path: name.clone(),
                 source_path: input.clone(),
+                content: content.clone(),
             });
-            root.add_file(FileEntry::from_path(name, input.clone()));
+            root.add_file(FileEntry::from_buffer(name, content));
             continue;
         }
 

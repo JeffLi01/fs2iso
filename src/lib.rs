@@ -223,7 +223,7 @@ pub fn build_iso(
         // trees), breaking the "files keep their names" promise and
         // desyncing the data tree from the esp.img FAT copy.
         validate_artifact_names(&collected_payload)?;
-        let esp_container = build_esp_container(&mut collected_payload)?;
+        let esp_container = build_esp_container(&collected_payload)?;
         collected_payload
             .tree
             .root
@@ -282,16 +282,12 @@ pub fn build_iso(
 
 /// Read every payload file into memory and build the FAT container (esp.img)
 /// that mirrors the image's file layout.
-fn build_esp_container(collected_payload: &mut CollectedPayload) -> Result<Vec<u8>, BuildError> {
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(collected_payload.records.len());
-    for record in &collected_payload.records {
-        let bytes = std::fs::read(&record.source_path)
-            .map_err(|error| BuildError::PayloadRead {
-                path: record.source_path.clone(),
-                message: error.to_string(),
-            })?;
-        entries.push((record.relative_path.clone(), bytes));
-    }
+fn build_esp_container(collected_payload: &CollectedPayload) -> Result<Vec<u8>, BuildError> {
+    let entries: Vec<(String, Vec<u8>)> = collected_payload
+        .records
+        .iter()
+        .map(|record| (record.relative_path.clone(), record.content.clone()))
+        .collect();
     esp::build_esp(&entries).map_err(BuildError::ImageBuild)
 }
 
@@ -357,6 +353,7 @@ mod tests {
             records: vec![FileRecord {
                 relative_path: "nested/esp.img".to_string(),
                 source_path: Path::new("nested/esp.img").to_path_buf(),
+                content: Vec::new(),
             }],
             directory_count: 0,
             payload_bytes: 0,
@@ -369,6 +366,7 @@ mod tests {
             records: vec![FileRecord {
                 relative_path: "ESP.IMG".to_string(),
                 source_path: Path::new("ESP.IMG").to_path_buf(),
+                content: Vec::new(),
             }],
             directory_count: 0,
             payload_bytes: 0,
