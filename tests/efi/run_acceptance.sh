@@ -12,8 +12,8 @@
 #   3. The internal shell auto-runs startup.nsh from the ESP volume root
 #      (EDK2 shells scan filesystem roots for startup.nsh); the script checks
 #      payload files then writes the isa-debug-exit IO port via `mm`, which
-#      makes qemu self-exit with code 1.
-#   4. Verdict = process lifetime: exit 1 within the watchdog = PASS,
+#      makes qemu self-exit with the dedicated code 85.
+#   4. Verdict = process lifetime: exit 85 within the watchdog = PASS,
 #      timeout/other = FAIL. No serial polling, no force-kill.
 #
 # Usage: bash tests/efi/run_acceptance.sh
@@ -65,7 +65,7 @@ VARS_SRC="$ASSETS/OVMF_VARS_4M.fd"
 }
 cp "$VARS_SRC" "$W/vars_run.fd"   # writable per-run copy
 
-rm -rf payload out.iso serial.log
+rm -rf payload out.iso
 mkdir -p payload/tools
 printf 'hello readme\n' > payload/readme.txt
 printf 'nested payload\n' > payload/tools/nested.txt
@@ -81,7 +81,7 @@ if exist readme.txt then
   ls tools
   type readme.txt
   type tools\nested.txt
-  mm -io 0x510 0x00 -w 2
+  mm -io 0x510 0x2a -w 2
 endif
 echo FS2ISO_TEST_NO_MOUNT_OR_READ
 NSH
@@ -112,18 +112,20 @@ set +e
   -drive if=pflash,format=raw,unit=1,file="$W/vars_run.fd" \
   -drive file="$ISO",format=raw,media=cdrom \
   -device isa-debug-exit,iobase=0x510,iosize=2 \
-  -m 512 -display none -monitor stdio -serial file:serial.log -no-reboot \
+  -m 512 -display none -monitor stdio -serial none -no-reboot \
   >qemu.out 2>qemu.err
 RC=$?
 set -e
 rm -f "$W/vars_run.fd"
 echo "== qemu exit code: $RC (watchdog=$WATCHDOG s) =="
-tr -d '\000' < serial.log 2>/dev/null | grep -aE "FS2ISO_TEST|FS_MOUNT_OK|hello readme|nested payload|UEFI Interactive|mm:" | head -10 || true
-if [ "$RC" = 1 ]; then
-  echo "ACCEPTANCE PASS (self-exit code 1)"
+if [ "$RC" = 85 ]; then
+  echo "ACCEPTANCE PASS (self-exit code 85)"
   exit 0
 elif [ "$RC" = 124 ]; then
   echo "ACCEPTANCE FAIL: watchdog timeout (internal shell not reached / volume not mounted)"
+  exit 1
+elif [ "$RC" = 1 ]; then
+  echo "ACCEPTANCE FAIL: qemu exited with generic code 1 without the acceptance magic value"
   exit 1
 else
   echo "ACCEPTANCE FAIL: qemu exited with unexpected code $RC"

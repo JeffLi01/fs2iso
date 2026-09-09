@@ -21,10 +21,11 @@ Shell"** (Boot Manager entry). Verified chain (all on this firmware):
    (`sendkey esc` → `down` → `ret`) to select **EFI Internal Shell**.
 4. The internal shell auto-runs `startup.nsh` from the ESP volume root
    (EDK2 shells scan filesystem roots for startup.nsh). The script checks
-   payload files, then `mm -io 0x510 0x00 -w 2` writes the QEMU
-   `isa-debug-exit` port → qemu self-exits with code 1.
-5. Verdict = process lifetime: exit 1 within the watchdog = PASS; timeout =
-   FAIL. No serial polling, no force-kill.
+   payload files, then `mm -io 0x510 0x2a -w 2` writes the QEMU
+   `isa-debug-exit` port with the acceptance magic value `0x2a` -> qemu
+   self-exits with code 85 (`(0x2a << 1) | 1`).
+5. Verdict = process lifetime: exit 85 within the watchdog = PASS; timeout or
+   any other exit code = FAIL. No serial polling, no force-kill.
 
 ## Verified facts (QEMU 11 + Debian OVMF/efi-shell 2026.05)
 
@@ -45,12 +46,14 @@ bash tests/efi/run_acceptance.sh
 ```
 
 Env overrides: `FS2ISO`, `QEMU`, `ASSETS`, `ISO`, `WATCHDOG` (s, default 90).
-Serial log kept at `tests/efi/serial.log` for diagnostics only.
+QEMU monitor output is redirected to `qemu.out`; QEMU errors are kept in
+`qemu.err` for diagnostics.
 
 Known quirks (calibrated):
 - EDK2 `mm -w` is in **bytes**; the debug-exit port address must be aligned
   to the access width (`0x510`/`-w 2` works; odd `0x501` errors).
-- qemu self-exit via isa-debug-exit does not flush `-serial file:` (0 bytes);
-  verdicts use the exit code only. Timeout (killed) runs keep the log.
+- The acceptance verdict does not depend on serial output. The dedicated
+   isa-debug-exit code 85 avoids treating a generic qemu exit code 1 as a pass.
+   Timeout (killed) runs keep `qemu.out` and `qemu.err` for diagnostics.
 - Boot-Manager navigation sleeps are topology/timing dependent; the watchdog
-  absorbs jitter, serial.log shows where it stopped on failure.
+   absorbs jitter.
