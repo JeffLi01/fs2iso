@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Seek;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -493,6 +494,45 @@ fn no_eltorito_is_plain_data_disc() {
             relative_path
         );
     }
+}
+
+#[test]
+fn bootable_build_preserves_only_empty_file() {
+    let fixture = Fixture::new();
+    fixture.file("empty.bin", &[]);
+    let out = fixture.dir.join("empty.iso");
+    let sum = build_iso(
+        &out,
+        std::slice::from_ref(&fixture.pkg),
+        &Options::default(),
+    )
+    .unwrap();
+    assert!(sum.bootable);
+    assert_eq!(sum.files, 1);
+    assert_eq!(sum.payload_bytes, 0);
+
+    let image = parse_image(&out);
+    let joliet_tree = walk(&image.img, joliet_lba(&image).unwrap() * SECTOR_BYTES, true);
+    let (_, size, esp_ext) = joliet_tree
+        .get("esp.img")
+        .copied()
+        .expect("esp.img present");
+    let esp_bytes = content(&image.img, esp_ext, size);
+    let filesystem =
+        fatfs::FileSystem::new(std::io::Cursor::new(esp_bytes), fatfs::FsOptions::new()).unwrap();
+    let mut empty_file = filesystem
+        .root_dir()
+        .open_dir("PKG")
+        .unwrap()
+        .open_file("EMPTY.BIN")
+        .unwrap();
+    assert_eq!(empty_file.seek(std::io::SeekFrom::End(0)).unwrap(), 0);
+
+    let (_, empty_size, _) = joliet_tree
+        .get("pkg/empty.bin")
+        .copied()
+        .expect("empty file present in Joliet tree");
+    assert_eq!(empty_size, 0);
 }
 
 /// Error paths: output overwriting a payload file and duplicate merged
