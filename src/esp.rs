@@ -104,13 +104,13 @@ fn validate_entries(entries: &[(String, Vec<u8>)]) -> Result<(), String> {
 /// it, creating intermediate directories as needed. Returns the raw FAT
 /// image bytes, ready to be stored as `esp.img` on the disc.
 pub fn build_esp(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
+    if entries.is_empty() {
+        return Err("nothing to pack into the FAT container".to_string());
+    }
     let payload_total: u64 = entries
         .iter()
         .map(|(_, content)| content.len() as u64)
         .sum();
-    if payload_total == 0 {
-        return Err("nothing to pack into the FAT container".to_string());
-    }
     validate_entries(entries)?;
     let mut image_bytes =
         ((payload_total + FORMATTING_SLACK_BYTES).div_ceil(SECTOR_SIZE)) * SECTOR_SIZE;
@@ -184,6 +184,8 @@ pub fn build_esp(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Seek;
+
     use super::*;
 
     fn entry(name: &str) -> (String, Vec<u8>) {
@@ -202,6 +204,18 @@ mod tests {
     #[test]
     fn allows_case_distinct_names_in_distinct_dirs() {
         build_esp(&[entry("dir/x.TXT"), entry("other/x.txt")]).unwrap();
+    }
+
+    #[test]
+    fn accepts_files_with_zero_payload_bytes() {
+        let image = build_esp(&[("empty.txt".to_string(), Vec::new())]).unwrap();
+        let filesystem = fatfs::FileSystem::new(
+            Cursor::new(image),
+            fatfs::FsOptions::new(),
+        )
+        .unwrap();
+        let mut file = filesystem.root_dir().open_file("empty.txt").unwrap();
+        assert_eq!(file.seek(std::io::SeekFrom::End(0)).unwrap(), 0);
     }
 
     #[test]
