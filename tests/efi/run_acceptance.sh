@@ -17,7 +17,8 @@
 #      timeout/other = FAIL. No serial polling, no force-kill.
 #
 # Usage: bash tests/efi/run_acceptance.sh
-# Env overrides: QEMU, ASSETS, FS2ISO, ISO, WATCHDOG (default 90)
+# Env overrides: QEMU, ASSETS, FS2ISO, ISO, WATCHDOG (default 90),
+# DEBUG_EXIT_VALUE (default 0x2a)
 set -eu
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 cd "$SCRIPT_DIR" || exit 1
@@ -55,6 +56,10 @@ ASSETS="${ASSETS:-$W/assets}"
 FS2ISO="${FS2ISO:-$W/../../target/release/$FS2ISO_NAME}"
 ISO="${ISO:-}"
 WATCHDOG="${WATCHDOG:-90}"
+# QEMU isa-debug-exit returns (value << 1) | 1. Keep the guest value as the
+# single source of truth and derive the host-side expected exit code.
+DEBUG_EXIT_VALUE="${DEBUG_EXIT_VALUE:-0x2a}"
+DEBUG_EXIT_CODE=$((DEBUG_EXIT_VALUE << 1 | 1))
 
 CODE="$ASSETS/OVMF_CODE_4M.fd"
 [ -f "$CODE" ] || CODE="$ASSETS/OVMF_CODE.fd"
@@ -71,7 +76,7 @@ printf 'hello readme\n' > payload/readme.txt
 printf 'nested payload\n' > payload/tools/nested.txt
 # startup.nsh: no boot file needed anywhere — files-only payload, the ESP
 # volume shows up as fs0 in this topology and the internal shell auto-runs
-cat > payload/startup.nsh <<'NSH'
+cat > payload/startup.nsh <<NSH
 @echo -off
 echo FS2ISO_TEST_START
 fs0:
@@ -81,7 +86,7 @@ if exist readme.txt then
   ls tools
   type readme.txt
   type tools\nested.txt
-  mm -io 0x510 0x2a -w 2
+  mm -io 0x510 $DEBUG_EXIT_VALUE -w 2
 endif
 echo FS2ISO_TEST_NO_MOUNT_OR_READ
 NSH
@@ -118,8 +123,8 @@ RC=$?
 set -e
 rm -f "$W/vars_run.fd"
 echo "== qemu exit code: $RC (watchdog=$WATCHDOG s) =="
-if [ "$RC" = 85 ]; then
-  echo "ACCEPTANCE PASS (self-exit code 85)"
+if [ "$RC" = "$DEBUG_EXIT_CODE" ]; then
+  echo "ACCEPTANCE PASS (self-exit code $DEBUG_EXIT_CODE)"
   exit 0
 elif [ "$RC" = 124 ]; then
   echo "ACCEPTANCE FAIL: watchdog timeout (internal shell not reached / volume not mounted)"

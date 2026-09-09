@@ -45,7 +45,9 @@ cargo build --release
 bash tests/efi/run_acceptance.sh
 ```
 
-Env overrides: `FS2ISO`, `QEMU`, `ASSETS`, `ISO`, `WATCHDOG` (s, default 90).
+Env overrides: `FS2ISO`, `QEMU`, `ASSETS`, `ISO`, `WATCHDOG` (s, default 90),
+and `DEBUG_EXIT_VALUE` (default `0x2a`). The expected QEMU exit code is derived
+as `(DEBUG_EXIT_VALUE << 1) | 1`.
 QEMU monitor output is redirected to `qemu.out`; QEMU errors are kept in
 `qemu.err` for diagnostics.
 
