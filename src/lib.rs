@@ -62,6 +62,7 @@ pub enum BuildError {
     PayloadRead { path: PathBuf, message: String },
     ImageBuild(String),
     OutputCreate { path: PathBuf, message: String },
+    OutputFinalize { path: PathBuf, message: String },
     ArtifactPatch(String),
 }
 
@@ -85,6 +86,9 @@ impl fmt::Display for BuildError {
             Self::ImageBuild(message) => write!(formatter, "image build failed: {}", message),
             Self::OutputCreate { path, message } => {
                 write!(formatter, "cannot create {:?}: {}", path, message)
+            }
+            Self::OutputFinalize { path, message } => {
+                write!(formatter, "cannot finalize {:?}: {}", path, message)
             }
             Self::ArtifactPatch(message) => write!(formatter, "{}", message),
         }
@@ -138,6 +142,27 @@ fn sectors_for(path: &Path) -> u64 {
     std::fs::metadata(path)
         .map(|metadata| metadata.len() / 2048)
         .unwrap_or(0)
+}
+
+fn temporary_output_path(output: &Path) -> PathBuf {
+    let file_name = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("fs2iso-output");
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let process_id = std::process::id();
+    for attempt in 0u32.. {
+        let suffix = if attempt == 0 {
+            format!("{}.tmp-{}", file_name, process_id)
+        } else {
+            format!("{}.tmp-{}-{}", file_name, process_id, attempt)
+        };
+        let candidate = parent.join(suffix);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
 }
 
 /// Build the image at `output` from `inputs`, honouring `options`.
@@ -207,35 +232,52 @@ pub fn build_iso(
         configure_eltorito(&mut image_options);
     }
 
-    let output_file = std::fs::OpenOptions::new()
+    let temporary_output = temporary_output_path(output);
+    let build_result = (|| {
+        let output_file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        .truncate(true)
-        .open(output)
+        .create_new(true)
+        .open(&temporary_output)
         .map_err(|error| BuildError::OutputCreate {
+            path: temporary_output.clone(),
+            message: error.to_string(),
+        })?;
+        hadris_cd::OpticalImageWriter::create(output_file, collected_payload.tree, image_options)
+        .map_err(|error| BuildError::ImageBuild(error.to_string()))?;
+
+        // Engine artifacts (esp.img, boot.catalog) must not clutter the data
+        // tree the user sees: mark them hidden in both namespaces.
+        if bootable {
+            artifacts::hide_engine_artifacts(&temporary_output).map_err(BuildError::ArtifactPatch)?;
+        }
+
+        let sectors = sectors_for(&temporary_output);
+        if output.exists() {
+            std::fs::remove_file(output).map_err(|error| BuildError::OutputFinalize {
+                path: output.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        }
+        std::fs::rename(&temporary_output, output).map_err(|error| BuildError::OutputFinalize {
             path: output.to_path_buf(),
             message: error.to_string(),
         })?;
-    hadris_cd::OpticalImageWriter::create(output_file, collected_payload.tree, image_options)
-        .map_err(|error| BuildError::ImageBuild(error.to_string()))?;
 
-    // Engine artifacts (esp.img, boot.catalog) must not clutter the data
-    // tree the user sees: mark them hidden in both namespaces.
-    if bootable {
-        artifacts::hide_engine_artifacts(output).map_err(BuildError::ArtifactPatch)?;
+        Ok(BuildSummary {
+            label,
+            dirs: collected_payload.directory_count,
+            files: collected_payload.records.len() as u64,
+            payload_bytes: collected_payload.payload_bytes,
+            sectors,
+            bootable,
+        })
+    })();
+    if build_result.is_err() {
+        let _ = std::fs::remove_file(&temporary_output);
     }
-
-    let sectors = sectors_for(output);
-
-    Ok(BuildSummary {
-        label,
-        dirs: collected_payload.directory_count,
-        files: collected_payload.records.len() as u64,
-        payload_bytes: collected_payload.payload_bytes,
-        sectors,
-        bootable,
-    })
+    build_result
 }
 
 /// Read every payload file into memory and build the FAT container (esp.img)
