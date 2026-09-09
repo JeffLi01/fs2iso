@@ -51,6 +51,8 @@ pub struct BuildSummary {
     pub bootable: bool,
 }
 
+const RESERVED_ARTIFACT_NAMES: [&str; 2] = ["esp.img", "boot.catalog"];
+
 /// Volume labels must be printable: ASCII alnum kept (uppercased), everything
 /// else becomes '_'.
 pub(crate) fn sanitize_label(raw: &str) -> String {
@@ -69,6 +71,36 @@ pub(crate) fn sanitize_label(raw: &str) -> String {
         out.push_str("FS2ISO");
     }
     out
+}
+
+fn resolve_label(output: &Path, requested: Option<&str>) -> String {
+    requested
+        .map(sanitize_label)
+        .or_else(|| output.file_stem().map(|stem| sanitize_label(&stem.to_string_lossy())))
+        .unwrap_or_else(|| "FS2ISO".to_string())
+}
+
+fn validate_artifact_names(collected_payload: &CollectedPayload) -> Result<(), String> {
+    let clash = collected_payload.records.iter().find(|record| {
+        RESERVED_ARTIFACT_NAMES
+            .iter()
+            .any(|reserved| record.relative_path.eq_ignore_ascii_case(reserved))
+    });
+    if let Some(clash) = clash {
+        return Err(format!(
+            "payload contains a root-level file named '{}', which is reserved for an \
+             engine artifact ({}); rename it",
+            clash.relative_path,
+            RESERVED_ARTIFACT_NAMES.join(" / ")
+        ));
+    }
+    Ok(())
+}
+
+fn sectors_for(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len() / 2048)
+        .unwrap_or(0)
 }
 
 /// Build the image at `output` from `inputs`, honouring `options`.
@@ -97,13 +129,7 @@ pub fn build_iso(
         }
     }
 
-    let label = match &options.label {
-        Some(label) => sanitize_label(label),
-        None => match output.file_stem() {
-            Some(stem) => sanitize_label(&stem.to_string_lossy()),
-            None => "FS2ISO".to_string(),
-        },
-    };
+    let label = resolve_label(output, options.label.as_deref());
 
     // UDF is disabled on purpose: hadris-cd's UDF layer is not
     // spec-complete (missing ECMA-167 file-set terminator), and Windows
@@ -134,20 +160,7 @@ pub fn build_iso(
         // the user's file (observed: boot.catalog -> boot_1.catalog in both
         // trees), breaking the "files keep their names" promise and
         // desyncing the data tree from the esp.img FAT copy.
-        const RESERVED_ARTIFACT_NAMES: [&str; 2] = ["esp.img", "boot.catalog"];
-        let clash = collected_payload.records.iter().find(|record| {
-            RESERVED_ARTIFACT_NAMES
-                .iter()
-                .any(|reserved| record.relative_path.eq_ignore_ascii_case(reserved))
-        });
-        if let Some(clash) = clash {
-            return Err(format!(
-                "payload contains a root-level file named '{}', which is reserved for an \
-                 engine artifact ({}); rename it",
-                clash.relative_path,
-                RESERVED_ARTIFACT_NAMES.join(" / ")
-            ));
-        }
+        validate_artifact_names(&collected_payload)?;
         let esp_container = build_esp_container(&mut collected_payload)?;
         collected_payload
             .tree
@@ -173,9 +186,7 @@ pub fn build_iso(
         artifacts::hide_engine_artifacts(output)?;
     }
 
-    let sectors = std::fs::metadata(output)
-        .map(|metadata| metadata.len() / 2048)
-        .unwrap_or(0);
+    let sectors = sectors_for(output);
 
     Ok(BuildSummary {
         label,
@@ -223,7 +234,14 @@ fn configure_eltorito(image_options: &mut OpticalImageOptions) {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_label;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{resolve_label, sanitize_label, sectors_for, validate_artifact_names};
+    use crate::collect::{CollectedPayload, FileRecord};
+    use hadris_cd::{Directory, FileTree};
+
+    static NEXT_TEMP_FILE: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn sanitize_ascii() {
@@ -234,5 +252,56 @@ mod tests {
         let long = sanitize_label(&"x".repeat(80));
         assert_eq!(long.len(), 32);
         assert!(long.bytes().all(|byte| byte == b'X'));
+    }
+
+    #[test]
+    fn resolve_label_prefers_requested_label_then_output_stem() {
+        assert_eq!(
+            resolve_label(Path::new("derived-name.iso"), Some("My Label")),
+            "MY_LABEL"
+        );
+        assert_eq!(resolve_label(Path::new("derived-name.iso"), None), "DERIVED_NAME");
+        assert_eq!(resolve_label(Path::new("."), None), "FS2ISO");
+    }
+
+    #[test]
+    fn validate_artifact_names_only_rejects_root_files() {
+        let mut tree = FileTree { root: Directory::root() };
+        let payload = CollectedPayload {
+            tree,
+            records: vec![FileRecord {
+                relative_path: "nested/esp.img".to_string(),
+                source_path: Path::new("nested/esp.img").to_path_buf(),
+            }],
+            directory_count: 0,
+            payload_bytes: 0,
+        };
+        validate_artifact_names(&payload).unwrap();
+
+        tree = FileTree { root: Directory::root() };
+        let payload = CollectedPayload {
+            tree,
+            records: vec![FileRecord {
+                relative_path: "ESP.IMG".to_string(),
+                source_path: Path::new("ESP.IMG").to_path_buf(),
+            }],
+            directory_count: 0,
+            payload_bytes: 0,
+        };
+        let error = validate_artifact_names(&payload).unwrap_err();
+        assert!(error.contains("reserved"));
+        assert!(error.contains("ESP.IMG"));
+    }
+
+    #[test]
+    fn sectors_for_reports_complete_iso_sectors() {
+        let path = std::env::temp_dir().join(format!(
+            "fs2iso-sectors-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, vec![0u8; 4096 + 17]).unwrap();
+        assert_eq!(sectors_for(&path), 2);
+        let _ = std::fs::remove_file(path);
     }
 }
